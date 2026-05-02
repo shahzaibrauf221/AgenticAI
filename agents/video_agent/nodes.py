@@ -3,14 +3,16 @@
 #
 # Contains:
 #   • scene_loader_node     — Loads Phase 1 script + Phase 2 audio results
-#   • video_gen_node        — Generates base video per scene
+#   • video_gen_node        — Generates base video per scene (detailed duration)
 #   • face_swap_node        — Applies character face-swap
-#   • lip_sync_node         — Syncs lips to Phase 2 audio (mixed dialogue+BGM)
+#   • lip_sync_node         — Syncs lips to Phase 2 audio; falls back to
+#                             background image + ambient audio when missing
+#   • _make_bg_image_scene  — ffmpeg helper: static image + ambient audio → MP4
+#   • _ambient_audio_for_scene — selects/generates ambient sound for a scene
 #   • compositor_node       — Concatenates all final scenes into final_output.mp4
 #   • finalizer_node        — Writes summary, marks pipeline complete
 #
-# All MCP tool calls go to studio_floor_server (port 8200) — same server
-# as Phase 2 but using a different subset of tools.
+# All MCP tool calls go to studio_floor_server (port 8200).
 # ============================================================
 
 import asyncio
@@ -18,6 +20,7 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
@@ -109,6 +112,296 @@ async def _wait_for_file(path: Path, timeout_s: float = 120.0, poll_s: float = 0
     return False
 
 
+def _has_ffmpeg() -> bool:
+    return shutil.which("ffmpeg") is not None
+
+
+# ─── Duration calculator ─────────────────────────────────────────────────────
+
+# Speech / reading pace constants
+_WORDS_PER_SECOND    = 2.3    # typical voiced narration pace
+_ACTION_BEAT_SECONDS = 3.0    # pause budget per action/visual beat line
+_INTER_LINE_GAP      = 0.6    # reaction pause between dialogue lines
+_TRANSITION_PAD      = 1.5    # lead-in + lead-out breathing room per scene
+_MIN_SCENE_DURATION  = 6.0    # never shorter than this (seconds)
+_MAX_SCENE_DURATION  = 180.0  # hard cap to prevent runaway scenes
+
+
+def _compute_scene_duration(scene: dict) -> float:
+    """
+    Estimate a realistic scene duration from ALL available scene fields:
+
+      1. scene["duration_s"]       — explicit override, respected as-is
+      2. dialogue lines            — word count / speaking rate + inter-line gap
+      3. action / stage directions — fixed beat duration each
+      4. scene["description"]      — background narration if no dialogue present
+      5. scene["visual_cue"]       — extra pad for each named visual cut/transition
+      6. Transition padding        — lead-in + lead-out breathing room
+
+    Returns a float in seconds, clamped to [_MIN_SCENE_DURATION, _MAX_SCENE_DURATION].
+    """
+    # 1. Explicit override
+    explicit = scene.get("duration_s") or scene.get("duration")
+    if explicit:
+        try:
+            return float(explicit)
+        except (TypeError, ValueError):
+            pass
+
+    total = 0.0
+
+    # 2. Dialogue lines
+    for beat in scene.get("dialogue", []) or []:
+        if not isinstance(beat, dict):
+            continue
+        line  = beat.get("line", "") or beat.get("text", "") or ""
+        words = len(line.split())
+        if words:
+            total += words / _WORDS_PER_SECOND + _INTER_LINE_GAP
+
+    # 3. Stage directions / action beats
+    for action in (scene.get("actions", [])
+                   or scene.get("action_beats", [])
+                   or []):
+        if isinstance(action, str) and action.strip():
+            total += _ACTION_BEAT_SECONDS
+        elif isinstance(action, dict):
+            desc = action.get("description", "") or action.get("action", "") or ""
+            if desc.strip():
+                total += _ACTION_BEAT_SECONDS
+
+    # 4. Scene description as narration (used only when no dialogue)
+    if total == 0.0:
+        description = (scene.get("description", "")
+                       or scene.get("scene_description", "")
+                       or scene.get("summary", "")
+                       or "")
+        words = len(description.split())
+        if words:
+            total += words / _WORDS_PER_SECOND
+
+    # 5. Visual cue padding
+    visual_cue = (scene.get("visual_cue", "")
+                  or scene.get("scene_visual_cue", "")
+                  or "")
+    if visual_cue.strip():
+        cuts = max(1, visual_cue.lower().count("cut to")
+                   + visual_cue.lower().count("fade")
+                   + visual_cue.lower().count("dissolve"))
+        total += cuts * 1.0
+
+    # 6. Transition breathing room
+    total += _TRANSITION_PAD
+
+    return max(_MIN_SCENE_DURATION, min(_MAX_SCENE_DURATION, total))
+
+
+# ─── Background image + ambient audio helpers ────────────────────────────────
+
+_GENRE_AMBIENT_MAP = {
+    "action":      "action cinematic tense",
+    "horror":      "horror dark ambient drone",
+    "comedy":      "light upbeat comedy underscore",
+    "romance":     "romantic soft piano",
+    "drama":       "dramatic strings underscore",
+    "thriller":    "thriller suspense low drone",
+    "sci-fi":      "sci-fi electronic ambient",
+    "fantasy":     "fantasy orchestral ambient",
+    "documentary": "neutral documentary ambient",
+    "adventure":   "adventure cinematic sweep",
+}
+
+_LOCATION_AMBIENT_MAP = {
+    "forest":     "forest birdsong nature ambient",
+    "city":       "city traffic urban ambient",
+    "street":     "street crowd urban ambient",
+    "office":     "office interior quiet ambient",
+    "house":      "interior home quiet ambient",
+    "home":       "interior home quiet ambient",
+    "school":     "school hallway ambient",
+    "beach":      "ocean waves beach ambient",
+    "ocean":      "ocean waves sea ambient",
+    "desert":     "desert wind ambient",
+    "mountain":   "mountain wind nature ambient",
+    "space":      "deep space sci-fi ambient",
+    "hospital":   "hospital interior ambient",
+    "bar":        "bar crowd indoor ambient",
+    "restaurant": "restaurant crowd indoor ambient",
+    "car":        "car interior engine ambient",
+    "night":      "night crickets dark ambient",
+}
+
+
+def _pick_ambient_keywords(scene: dict, manifest: dict) -> str:
+    """
+    Derive the best ambient sound description from scene + manifest metadata,
+    falling back gracefully through several heuristics.
+    """
+    # 1. Explicit ambient / mood tag on the scene itself
+    for key in ("ambient_sound", "ambient", "mood_sound", "background_music"):
+        val = scene.get(key, "")
+        if val and isinstance(val, str):
+            return val
+
+    # 2. Location keyword matching
+    location = (scene.get("location", "") or "").lower()
+    for kw, track in _LOCATION_AMBIENT_MAP.items():
+        if kw in location:
+            return track
+
+    # 3. Genre from manifest
+    genre = (manifest.get("genre", "") or "").lower()
+    for kw, track in _GENRE_AMBIENT_MAP.items():
+        if kw in genre:
+            return track
+
+    # 4. Scene mood / tone field
+    mood = (scene.get("mood", "") or scene.get("tone", "") or "").lower()
+    for kw, track in _GENRE_AMBIENT_MAP.items():
+        if kw in mood:
+            return track
+
+    # 5. Safe default
+    return "neutral cinematic ambient underscore"
+
+
+async def _fetch_or_generate_ambient(
+    scene: dict,
+    manifest: dict,
+    sid,
+    duration_s: float,
+) -> str:
+    """
+    Ask the MCP server for a background ambient audio track.
+    Returns the file path (str) or "" on failure.
+    """
+    keywords = _pick_ambient_keywords(scene, manifest)
+    print(f"  [Ambient Audio | scene {sid}] Requesting: '{keywords}' ({duration_s:.1f}s)")
+    try:
+        raw = await _call_tool(
+            "query_ambient_audio",
+            scene_id=sid,
+            keywords=keywords,
+            duration_s=duration_s,
+            location=scene.get("location", ""),
+        )
+        result = _safe_parse(raw)
+        path = result.get("file", "")
+        if path:
+            print(f"  [Ambient Audio | scene {sid}] ✓ {path}")
+        else:
+            print(f"  [Ambient Audio | scene {sid}] ⚠ MCP returned no file")
+        return path
+    except Exception as e:
+        print(f"  [Ambient Audio | scene {sid}] ✗ Error: {e}")
+        return ""
+
+
+async def _fetch_or_generate_bg_image(
+    scene: dict,
+    manifest: dict,
+    sid,
+) -> str:
+    """
+    Ask the MCP server for a background image matching the scene.
+    Returns the file path (str) or "" on failure.
+    """
+    visual_cue = (scene.get("scene_visual_cue", "")
+                  or scene.get("visual_cue", "")
+                  or scene.get("description", "")
+                  or scene.get("location", "")
+                  or "cinematic scene")
+    print(f"  [BG Image      | scene {sid}] Requesting: '{visual_cue[:60]}'")
+    try:
+        raw = await _call_tool(
+            "query_stock_image",
+            scene_id=sid,
+            visual_cue=visual_cue,
+            location=scene.get("location", ""),
+            mood=scene.get("mood", "") or scene.get("tone", ""),
+        )
+        result = _safe_parse(raw)
+        path = result.get("file", "")
+        if path:
+            print(f"  [BG Image      | scene {sid}] ✓ {path}")
+        else:
+            print(f"  [BG Image      | scene {sid}] ⚠ MCP returned no image")
+        return path
+    except Exception as e:
+        print(f"  [BG Image      | scene {sid}] ✗ Error: {e}")
+        return ""
+
+
+def _make_bg_image_scene(
+    image_path: str,
+    audio_path: str,
+    duration_s: float,
+    output_path: Path,
+) -> bool:
+    """
+    Compose a static background image + ambient audio into an MP4 using ffmpeg.
+
+    • Video: looped still image → 1920×1080, 24 fps, letterboxed/pillarboxed
+    • Audio: ambient track trimmed/padded to duration_s
+    • Falls back to black frame if image missing; silent track if audio missing.
+
+    Returns True on success.
+    """
+    if not _has_ffmpeg():
+        print("  [BG Composer] ✗ ffmpeg not available")
+        return False
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if image_path and Path(image_path).exists():
+        video_input = [
+            "-loop", "1",
+            "-framerate", "24",
+            "-i", str(Path(image_path).resolve()),
+        ]
+    else:
+        # Pure black frame
+        video_input = [
+            "-f", "lavfi",
+            "-i", "color=c=black:size=1920x1080:rate=24",
+        ]
+
+    if audio_path and Path(audio_path).exists():
+        audio_input = ["-i", str(Path(audio_path).resolve())]
+        audio_map   = ["-map", "1:a"]
+        audio_codec = ["-c:a", "aac", "-b:a", "192k", "-shortest"]
+    else:
+        audio_input = ["-f", "lavfi",
+                       "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"]
+        audio_map   = ["-map", "1:a"]
+        audio_codec = ["-c:a", "aac", "-b:a", "64k"]
+
+    cmd = [
+        "ffmpeg", "-y",
+        *video_input,
+        *audio_input,
+        "-map", "0:v",
+        *audio_map,
+        "-c:v", "libx264", "-preset", "fast", "-tune", "stillimage",
+        "-pix_fmt", "yuv420p",
+        "-vf", ("scale=1920:1080:force_original_aspect_ratio=decrease,"
+                "pad=1920:1080:(ow-iw)/2:(oh-ih)/2"),
+        *audio_codec,
+        "-t", str(duration_s),
+        str(output_path),
+    ]
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if proc.returncode == 0:
+            return True
+        print(f"  [BG Composer] ✗ ffmpeg error:\n{proc.stderr[-400:]}")
+        return False
+    except subprocess.TimeoutExpired:
+        print("  [BG Composer] ✗ ffmpeg timed out")
+        return False
+
+
 # ─── Node 1: Scene Loader ─────────────────────────────────────────────────────
 
 async def scene_loader_node(state: AgentState) -> dict:
@@ -154,7 +447,8 @@ async def scene_loader_node(state: AgentState) -> dict:
         print(f"[Scene Loader] Source: scene_manifest.json (fallback)")
 
     scenes = manifest.get("scenes", [])
-    print(f"[Scene Loader] {len(scenes)} scenes, {len(char_db.get('characters', []))} characters")
+    print(f"[Scene Loader] {len(scenes)} scenes, "
+          f"{len(char_db.get('characters', []))} characters")
 
     # Pull Phase 2 audio results from MCP memory if not in state
     audio_tracks = dict(state.get("audio_tracks") or {})
@@ -214,27 +508,46 @@ async def scene_loader_node(state: AgentState) -> dict:
 # ─── Node 2: Video Gen ────────────────────────────────────────────────────────
 
 async def video_gen_node(state: AgentState) -> dict:
-    """PDF §5.3 — generate base video for one scene."""
+    """
+    Generate base video for one scene.
+
+    Duration is computed from ALL available scene data:
+      explicit duration_s  >  dialogue word count  >  action beats
+      >  description narration  >  visual cue cuts  >  transition padding.
+
+    This ensures the video is long enough to hold all content comfortably.
+    """
     scene = state.get("_current_scene", {})
     sid   = scene.get("scene_id")
     chars = scene.get("characters", [])
 
-    duration = max(3.0, sum(max(1, len(d.get("line", "").split())) / 2.5
-                            for d in scene.get("dialogue", []) if isinstance(d, dict)))
+    duration = _compute_scene_duration(scene)
 
-    print(f"  [Video Gen    | scene {sid}] Rendering {duration:.1f}s base video...")
+    n_dialogue = len(scene.get("dialogue", []) or [])
+    n_actions  = len(scene.get("actions", [])
+                     or scene.get("action_beats", []) or [])
+    print(f"  [Video Gen    | scene {sid}] Rendering {duration:.1f}s "
+          f"({n_dialogue} dialogue lines, {n_actions} action beats)")
 
     raw = await _call_tool(
         "query_stock_footage",
-        scene_id=sid, location=scene.get("location", ""),
-        characters=chars, visual_cue=scene.get("scene_visual_cue", ""),
+        scene_id=sid,
+        location=scene.get("location", ""),
+        characters=chars,
+        visual_cue=scene.get("scene_visual_cue", "") or scene.get("visual_cue", ""),
         duration_s=duration,
+        mood=scene.get("mood", "") or scene.get("tone", ""),
+        description=scene.get("description", "") or scene.get("scene_description", ""),
     )
     base = _safe_parse(raw)
     base_video = base.get("file", "")
 
-    payload = {"scene_id": sid, "base_video": base_video,
-               "duration_s": duration, "characters": chars}
+    payload = {
+        "scene_id":   sid,
+        "base_video": base_video,
+        "duration_s": duration,
+        "characters": chars,
+    }
 
     await _call_tool(
         "commit_memory",
@@ -243,7 +556,7 @@ async def video_gen_node(state: AgentState) -> dict:
         category="video_clip",
     )
 
-    print(f"  [Video Gen    | scene {sid}] ✓ {base_video}")
+    print(f"  [Video Gen    | scene {sid}] ✓ {base_video} ({duration:.1f}s)")
     return {"video_clips": {str(sid): payload}}
 
 
@@ -251,13 +564,13 @@ async def video_gen_node(state: AgentState) -> dict:
 
 async def face_swap_node(state: AgentState) -> dict:
     """PDF §5.4 — validate identity, then composite character face onto base video."""
-    scene   = state.get("_current_scene", {})
-    char_db = state.get("character_db", {})
-    sid     = scene.get("scene_id")
-    chars   = scene.get("characters", [])
+    scene    = state.get("_current_scene", {})
+    char_db  = state.get("character_db", {})
+    sid      = scene.get("scene_id")
+    chars    = scene.get("characters", [])
     location = scene.get("location", "")
-    primary = chars[0] if chars else "Unknown"
-    skey    = str(sid)
+    primary  = chars[0] if chars else "Unknown"
+    skey     = str(sid)
 
     print(f"  [Face Swap    | scene {sid}] Validating identity for '{primary}'...")
     raw = await _call_tool(
@@ -276,9 +589,11 @@ async def face_swap_node(state: AgentState) -> dict:
             "primary_character": primary, "identity_verified": False,
             "skipped_reason": validation.get("reason"),
         }
-        await _call_tool("commit_memory",
-                         key=f"faceswap_scene_{sid:02d}" if isinstance(sid, int) else f"faceswap_scene_{sid}",
-                         value=json.dumps(payload), category="face_swap")
+        await _call_tool(
+            "commit_memory",
+            key=f"faceswap_scene_{sid:02d}" if isinstance(sid, int) else f"faceswap_scene_{sid}",
+            value=json.dumps(payload), category="face_swap",
+        )
         return {"face_swapped_clips": {skey: payload}}
 
     expected = _expected_base_video_path(sid, location)
@@ -321,13 +636,25 @@ async def face_swap_node(state: AgentState) -> dict:
     return {"face_swapped_clips": {skey: payload}}
 
 
-# ─── Node 4: Lip Sync ─────────────────────────────────────────────────────────
+# ─── Node 4: Lip Sync — with full fallback logic ─────────────────────────────
 
 async def lip_sync_node(state: AgentState) -> dict:
-    """PDF §5.5 — align Phase 2's mixed audio to face-swapped video."""
-    scene = state.get("_current_scene", {})
-    sid   = scene.get("scene_id")
-    skey  = str(sid)
+    """
+    PDF §5.5 — align Phase 2's mixed audio to face-swapped video.
+
+    Fallback matrix
+    ──────────────────────────────────────────────────────────────
+    video ✓  audio ✓  → normal lip_sync_aligner                (Case A)
+    video ✓  audio ✗  → mix ambient audio onto existing video  (Case B)
+    video ✗  audio ✓  → bg image + dialogue audio → ffmpeg MP4 (Case C)
+    video ✗  audio ✗  → bg image + ambient audio  → ffmpeg MP4 (Case D)
+    ──────────────────────────────────────────────────────────────
+    No scene is ever silently dropped.
+    """
+    scene    = state.get("_current_scene", {})
+    manifest = state.get("scene_manifest", {}) or {}
+    sid      = scene.get("scene_id")
+    skey     = str(sid)
 
     audio_entry = (state.get("audio_tracks") or {}).get(skey, {})
     video_entry = (state.get("face_swapped_clips") or {}).get(skey, {})
@@ -335,50 +662,139 @@ async def lip_sync_node(state: AgentState) -> dict:
     audio_files = audio_entry.get("files", [])
     video_file  = video_entry.get("face_swapped_file", "")
 
-    if not video_file:
-        print(f"  [Lip Sync     | scene {sid}] ⚠ No video — skipping")
-        return {
-            "final_scenes": {skey: {"scene_id": sid, "status": "skipped",
-                                    "reason": "no video"}},
+    duration = _compute_scene_duration(scene)
+
+    out_dir = Path(__file__).resolve().parent.parent.parent / "outputs" / "final"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── Case A: Both present → normal lip-sync ────────────────────────────────
+    if video_file and audio_files:
+        print(f"  [Lip Sync     | scene {sid}] Aligning audio + video...")
+        raw = await _call_tool(
+            "lip_sync_aligner",
+            scene_id=sid, video_path=video_file, audio_files=audio_files,
+        )
+        try:
+            result = _safe_parse(raw)
+        except Exception as e:
+            result = {"status": "error", "error": str(e), "scene_id": sid}
+
+        await _call_tool(
+            "commit_memory",
+            key=f"final_scene_{sid:02d}" if isinstance(sid, int) else f"final_scene_{sid}",
+            value=json.dumps(result), category="final_scene",
+        )
+        score = result.get("lip_sync_score", 0)
+        dur   = result.get("duration_s", 0)
+        print(f"  [Lip Sync     | scene {sid}] ✓ {result.get('file', 'N/A')} "
+              f"(score={score}, {dur}s)")
+        return {"final_scenes": {skey: result}}
+
+    # ── Case B: Video ✓, Audio ✗ → overlay ambient sound ─────────────────────
+    if video_file and not audio_files:
+        print(f"  [Lip Sync     | scene {sid}] ⚠ No dialogue audio — "
+              f"adding ambient track to existing video")
+
+        ambient_path = await _fetch_or_generate_ambient(scene, manifest, sid, duration)
+        out_file = out_dir / f"scene_{sid}_ambient.mp4"
+
+        if ambient_path and _has_ffmpeg():
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", str(Path(video_file).resolve()),
+                "-i", str(Path(ambient_path).resolve()),
+                "-map", "0:v", "-map", "1:a",
+                "-c:v", "copy",
+                "-c:a", "aac", "-b:a", "192k",
+                "-shortest",
+                str(out_file),
+            ]
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+                if proc.returncode == 0:
+                    result = {
+                        "scene_id":     sid,
+                        "file":         str(out_file),
+                        "status":       "ambient_audio_fallback",
+                        "duration_s":   duration,
+                        "ambient_track": ambient_path,
+                    }
+                    await _call_tool(
+                        "commit_memory",
+                        key=f"final_scene_{sid:02d}" if isinstance(sid, int) else f"final_scene_{sid}",
+                        value=json.dumps(result), category="final_scene",
+                    )
+                    print(f"  [Lip Sync     | scene {sid}] ✓ Ambient mix → {out_file}")
+                    return {"final_scenes": {skey: result}}
+                else:
+                    print(f"  [Lip Sync     | scene {sid}] ✗ ffmpeg ambient mix failed: "
+                          f"{proc.stderr[-300:]}")
+            except subprocess.TimeoutExpired:
+                print(f"  [Lip Sync     | scene {sid}] ✗ ffmpeg ambient mix timed out")
+
+        # Sub-fallback: return silent video as-is
+        result = {
+            "scene_id":   sid,
+            "file":       video_file,
+            "status":     "no_audio_fallback",
+            "duration_s": duration,
         }
+        await _call_tool(
+            "commit_memory",
+            key=f"final_scene_{sid:02d}" if isinstance(sid, int) else f"final_scene_{sid}",
+            value=json.dumps(result), category="final_scene",
+        )
+        print(f"  [Lip Sync     | scene {sid}] ⚠ Using video without audio track")
+        return {"final_scenes": {skey: result}}
 
-    if not audio_files:
-        print(f"  [Lip Sync     | scene {sid}] ⚠ No audio — skipping")
-        return {
-            "final_scenes": {skey: {"scene_id": sid, "status": "skipped",
-                                    "reason": "no audio"}},
-        }
+    # ── Cases C & D: No face-swapped video → build from background image ──────
+    print(f"  [Lip Sync     | scene {sid}] ⚠ No face-swapped video — "
+          f"compositing background-image scene ({duration:.1f}s)")
 
-    print(f"  [Lip Sync     | scene {sid}] Aligning audio + video...")
+    bg_image = await _fetch_or_generate_bg_image(scene, manifest, sid)
 
-    raw = await _call_tool(
-        "lip_sync_aligner",
-        scene_id=sid, video_path=video_file, audio_files=audio_files,
+    # For audio: prefer dialogue track (Case C), else ambient (Case D)
+    audio_src: str = audio_files[0] if audio_files else ""
+    if not audio_src:
+        audio_src = await _fetch_or_generate_ambient(scene, manifest, sid, duration)
+
+    out_file = out_dir / f"scene_{sid}_bg_fallback.mp4"
+
+    success = _make_bg_image_scene(
+        image_path=bg_image or "",
+        audio_path=audio_src or "",
+        duration_s=duration,
+        output_path=out_file,
     )
-    try:
-        result = _safe_parse(raw)
-    except Exception as e:
-        result = {"status": "error", "error": str(e), "scene_id": sid}
+
+    if success:
+        result = {
+            "scene_id":   sid,
+            "file":       str(out_file),
+            "status":     "bg_image_fallback",
+            "duration_s": duration,
+            "bg_image":   bg_image,
+            "audio_src":  audio_src,
+        }
+        print(f"  [Lip Sync     | scene {sid}] ✓ BG-image scene → {out_file}")
+    else:
+        result = {
+            "scene_id": sid,
+            "file":     "",
+            "status":   "failed",
+            "reason":   "no video, no ffmpeg, or ffmpeg composition error",
+        }
+        print(f"  [Lip Sync     | scene {sid}] ✗ Could not build fallback scene")
 
     await _call_tool(
         "commit_memory",
         key=f"final_scene_{sid:02d}" if isinstance(sid, int) else f"final_scene_{sid}",
         value=json.dumps(result), category="final_scene",
     )
-
-    score = result.get("lip_sync_score", 0)
-    dur   = result.get("duration_s", 0)
-    print(f"  [Lip Sync     | scene {sid}] ✓ {result.get('file', 'N/A')}  "
-          f"(score={score}, {dur}s)")
-
     return {"final_scenes": {skey: result}}
 
 
 # ─── Node 5: Compositor ───────────────────────────────────────────────────────
-
-def _has_ffmpeg() -> bool:
-    return shutil.which("ffmpeg") is not None
-
 
 async def compositor_node(state: AgentState) -> dict:
     """
@@ -392,22 +808,21 @@ async def compositor_node(state: AgentState) -> dict:
     finals = state.get("final_scenes", {}) or {}
     scenes = state.get("scenes", []) or []
 
-    # Order scenes by scene_id
     ordered_scenes = sorted(
         [s for s in scenes if isinstance(s, dict)],
         key=lambda s: s.get("scene_id", 0),
     )
 
-    # Collect per-scene final MP4 paths in scene order
     scene_files = []
     for s in ordered_scenes:
-        sid = str(s.get("scene_id"))
+        sid  = str(s.get("scene_id"))
         info = finals.get(sid, {})
-        f = info.get("file", "")
+        f    = info.get("file", "")
         if f and Path(f).exists() and Path(f).stat().st_size > 0:
             scene_files.append(f)
         else:
-            print(f"  [Compositor] ⚠ scene {sid}: no usable final file")
+            print(f"  [Compositor] ⚠ scene {sid}: no usable final file "
+                  f"(status={info.get('status', 'missing')})")
 
     if not scene_files:
         return {
@@ -422,7 +837,6 @@ async def compositor_node(state: AgentState) -> dict:
 
     if not _has_ffmpeg():
         print(f"  [Compositor] ✗ ffmpeg not available — cannot concatenate")
-        print(f"  [Compositor]   scene files would have been:")
         for f in scene_files:
             print(f"      • {f}")
         return {
@@ -431,7 +845,6 @@ async def compositor_node(state: AgentState) -> dict:
             "errors":       ["ffmpeg not available — final_output.mp4 not generated"],
         }
 
-    # Build concat list file
     concat_list = out_dir / "_concat.txt"
     concat_list.write_text(
         "\n".join(f"file '{Path(f).resolve()}'" for f in scene_files) + "\n",
@@ -448,7 +861,6 @@ async def compositor_node(state: AgentState) -> dict:
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if proc.returncode != 0:
-            # Fallback: re-encode if stream copy fails (codec mismatch)
             print(f"  [Compositor] copy failed, re-encoding...")
             cmd_re = [
                 "ffmpeg", "-y", "-f", "concat", "-safe", "0",
@@ -476,7 +888,8 @@ async def compositor_node(state: AgentState) -> dict:
         except Exception:
             pass
 
-    print(f"  [Compositor] ✓ {final_path}  ({final_path.stat().st_size / (1024*1024):.1f} MB)")
+    print(f"  [Compositor] ✓ {final_path}  "
+          f"({final_path.stat().st_size / (1024*1024):.1f} MB)")
 
     await _call_tool(
         "commit_memory", key="final_video",
@@ -507,6 +920,7 @@ async def finalizer_node(state: AgentState) -> dict:
         "final_mp4s":        len(finals),
         "final_video":       state.get("final_video", ""),
         "scene_files":       {sid: v.get("file") for sid, v in finals.items()},
+        "scene_statuses":    {sid: v.get("status", "unknown") for sid, v in finals.items()},
         "lip_sync_scores":   {sid: v.get("lip_sync_score") for sid, v in finals.items()},
         "identity_verified": {sid: v.get("identity_verified") for sid, v in videos.items()},
     }
