@@ -1,0 +1,700 @@
+# ============================================================
+# writers_room_server.py
+# MCP Server — All tools for the Writer's Room multi-agent system
+# Uses Groq (LLaMA) for LLM calls and ChromaDB for vector memory.
+# Run: python mcp_servers/writers_room_server.py
+# ============================================================
+
+import json
+import os
+import time
+import uuid
+from datetime import datetime
+from pathlib import Path
+
+import chromadb
+import requests
+from groq import Groq
+from mcp.server.fastmcp import FastMCP
+
+# ─── Load .env automatically ──────────────────────────────────────────────────
+def _load_env():
+    for candidate in [
+        Path(__file__).parent.parent / ".env",   # project root (writers-room/.env)
+        Path(__file__).parent / ".env",           # mcp_servers/.env
+    ]:
+        if candidate.exists():
+            for line in candidate.read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key   = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key and value and key not in os.environ:
+                    os.environ[key] = value
+            break
+
+_load_env()
+
+# ─── Init ─────────────────────────────────────────────────────────────────────
+mcp = FastMCP("writers_room", port=8100)
+
+BASE_DIR   = Path(__file__).parent.parent
+MEMORY_DIR = BASE_DIR / "memory"
+OUTPUT_DIR = BASE_DIR / "outputs"
+IMAGE_DIR  = OUTPUT_DIR / "image_assets"
+
+MEMORY_DIR.mkdir(exist_ok=True)
+OUTPUT_DIR.mkdir(exist_ok=True)
+IMAGE_DIR.mkdir(exist_ok=True)
+
+CHROMA_DIR    = MEMORY_DIR / "chroma"
+MANIFEST_FILE = OUTPUT_DIR / "scene_manifest.json"
+CHAR_DB_FILE  = OUTPUT_DIR / "character_db.json"
+
+# ─── ChromaDB Setup (Vector Memory — satisfies spec §3.3) ─────────────────────
+_chroma_client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+_memory_collection = _chroma_client.get_or_create_collection(
+    name="writers_room_memory",
+    metadata={"description": "Persistent memory for scripts, characters, images"},
+)
+
+# ─── Groq Setup ───────────────────────────────────────────────────────────────
+_groq_client = Groq(api_key=os.environ["GROQ_API_KEY"])
+
+_MODELS = [
+    "llama-3.3-70b-versatile",
+    "llama-3.1-70b-versatile",
+    "llama-3.1-8b-instant",
+]
+
+# ─── Rate limiter — max 10 calls/min ──────────────────────────────────────────
+_last_call_time = 0.0
+
+def _rate_limit():
+    global _last_call_time
+    gap = 6.0 - (time.time() - _last_call_time)
+    if gap > 0:
+        time.sleep(gap)
+    _last_call_time = time.time()
+
+
+def _llm(system: str, user: str) -> str:
+    """
+    LLM call via Groq with automatic retry and model fallback.
+    Combines system + user into a single clear instruction for best results.
+    """
+    _rate_limit()
+    last_error = None
+
+    combined_user = f"{system}\n\nUser request: {user}"
+
+    for model in _MODELS:
+        for attempt in range(3):
+            try:
+                response = _groq_client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": "You are a helpful assistant. Always return only valid JSON with no markdown fences, no explanation, no extra text."},
+                        {"role": "user",   "content": combined_user},
+                    ],
+                    temperature=0.7,
+                    max_tokens=4096,
+                )
+                if attempt > 0 or model != _MODELS[0]:
+                    print(f"[Groq] Success with model={model} attempt={attempt + 1}")
+                return response.choices[0].message.content
+
+            except Exception as e:
+                last_error = e
+                err_str    = str(e)
+
+                if "429" in err_str or "rate_limit" in err_str.lower():
+                    if attempt < 2:
+                        wait = 30
+                        print(f"[Groq] Rate limited on {model}. Waiting {wait}s (attempt {attempt + 1}/3)...")
+                        time.sleep(wait)
+                    else:
+                        print(f"[Groq] Quota exhausted on {model}, trying next model...")
+                        break
+                else:
+                    raise
+
+    raise RuntimeError(f"All Groq models exhausted. Last error: {last_error}")
+
+
+def _save_json(path: Path, data):
+    path.write_text(json.dumps(data, indent=2))
+
+
+def _unwrap_llm_output(raw: str) -> str:
+    """
+    Defensive unwrapper for LLM content blocks.
+    Handles plain strings, content-block dicts, and lists of content blocks.
+    Strips markdown fences.
+    """
+    def _strip_fences(s: str) -> str:
+        s = s.strip()
+        if s.startswith("```"):
+            s = s.split("\n", 1)[-1]
+            if s.endswith("```"):
+                s = s.rsplit("```", 1)[0]
+        return s.strip()
+
+    raw = raw.strip()
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return _strip_fences(raw)
+
+    if isinstance(parsed, list):
+        for block in parsed:
+            if isinstance(block, dict) and block.get("type") == "text":
+                return _strip_fences(block["text"])
+        return raw
+
+    if isinstance(parsed, dict) and parsed.get("type") == "text" and "text" in parsed:
+        return _strip_fences(parsed["text"])
+
+    return raw
+
+
+# ─── Scriptwriter Tools ───────────────────────────────────────────────────────
+
+@mcp.tool()
+def generate_script_segment(prompt: str, num_scenes: int = 3) -> str:
+    """
+    Generate a structured multi-scene screenplay from a user prompt.
+    Returns a JSON string with scenes, dialogues, and visual cues.
+    """
+    system = f"""You are a professional screenplay writer.
+Write exactly {num_scenes} scenes for the story idea given by the user.
+Return ONLY a valid JSON object with NO markdown, NO code fences, NO explanation.
+Use exactly this structure:
+{{
+  "title": "actual story title here",
+  "genre": "actual genre here",
+  "scenes": [
+    {{
+      "scene_id": 1,
+      "location": "specific place name",
+      "time_of_day": "day or night or dawn etc",
+      "characters": ["Character Name 1", "Character Name 2"],
+      "action_description": "detailed description of what happens in this scene",
+      "dialogue": [
+        {{
+          "speaker": "Character Name",
+          "line": "what they say",
+          "visual_cue": "how they look or move while saying it"
+        }}
+      ],
+      "scene_visual_cue": "overall visual description of the scene"
+    }}
+  ]
+}}
+Fill in ALL fields with real content. Do not use placeholder words like 'string' or 'name'."""
+
+    return _llm(system, prompt)
+
+
+@mcp.tool()
+def validate_script(script_json: str) -> str:
+    """
+    Validate a manually provided script JSON for structural correctness.
+    Returns a JSON object:
+      {"valid": bool, "errors": [...], "warnings": [...], "suggestions": [...]}
+
+    Each suggestion is an actionable fix for a corresponding error.
+    """
+    errors      = []
+    warnings    = []
+    suggestions = []
+
+    try:
+        script = json.loads(script_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({
+            "valid":       False,
+            "errors":      [f"Invalid JSON: {e}"],
+            "warnings":    [],
+            "suggestions": [
+                "Verify the file is valid JSON. Check for missing commas, "
+                "unclosed brackets, or unescaped quotes."
+            ],
+        })
+
+    if not isinstance(script, dict):
+        return json.dumps({
+            "valid":       False,
+            "errors":      ["Top-level payload is not a JSON object."],
+            "warnings":    [],
+            "suggestions": ['Wrap your script in an object: {"scenes": [...]}'],
+        })
+
+    scenes = script.get("scenes", [])
+    if not scenes:
+        errors.append("No 'scenes' array found.")
+        suggestions.append(
+            "Add a top-level 'scenes' array containing at least one scene object."
+        )
+
+    for i, scene in enumerate(scenes):
+        sid = scene.get("scene_id", i + 1)
+
+        # Scene header check (PDF §4 Mode 1)
+        if not scene.get("location"):
+            errors.append(f"Scene {sid}: missing 'location'.")
+            suggestions.append(
+                f"Scene {sid}: add a 'location' field "
+                f"(e.g., 'City Street — Night', 'Abandoned Warehouse')."
+            )
+
+        # Action description check (PDF §4 Mode 1)
+        if not scene.get("action_description"):
+            warnings.append(f"Scene {sid}: missing 'action_description'.")
+            suggestions.append(
+                f"Scene {sid}: add an 'action_description' describing what "
+                f"physically happens in the scene."
+            )
+
+        # Dialogue label checks (PDF §4 Mode 1)
+        dialogues = scene.get("dialogue", [])
+        if not dialogues:
+            warnings.append(f"Scene {sid}: no dialogue entries.")
+            suggestions.append(
+                f"Scene {sid}: add at least one dialogue entry with "
+                f"'speaker', 'line', and 'visual_cue' fields."
+            )
+        elif isinstance(dialogues, list):
+            for j, d in enumerate(dialogues):
+                if not isinstance(d, dict):
+                    errors.append(
+                        f"Scene {sid}, dialogue {j}: must be an object, not "
+                        f"{type(d).__name__}."
+                    )
+                    suggestions.append(
+                        f"Scene {sid}, dialogue {j}: replace with "
+                        f'{{"speaker": "...", "line": "...", "visual_cue": "..."}}'
+                    )
+                    continue
+                if not d.get("speaker"):
+                    errors.append(f"Scene {sid}, dialogue {j}: missing 'speaker'.")
+                    suggestions.append(
+                        f"Scene {sid}, dialogue {j}: add a 'speaker' field "
+                        f"with the character's name."
+                    )
+                if not d.get("line"):
+                    errors.append(f"Scene {sid}, dialogue {j}: missing 'line'.")
+                    suggestions.append(
+                        f"Scene {sid}, dialogue {j}: add a 'line' field with "
+                        f"the actual dialogue text."
+                    )
+                if not d.get("visual_cue"):
+                    warnings.append(
+                        f"Scene {sid}, dialogue {j}: missing 'visual_cue'."
+                    )
+                    suggestions.append(
+                        f"Scene {sid}, dialogue {j}: add a 'visual_cue' "
+                        f"describing blocking, expression, or camera note."
+                    )
+
+    return json.dumps({
+        "valid":       len(errors) == 0,
+        "errors":      errors,
+        "warnings":    warnings,
+        "suggestions": suggestions,
+    })
+
+
+# ─── Character Designer Tools ─────────────────────────────────────────────────
+
+@mcp.tool()
+def extract_characters(script_json: str) -> str:
+    """
+    Extract and formalize character identities from a script JSON.
+    Returns a JSON array of character profiles.
+    """
+    system = """You are a character designer for films.
+Given a screenplay JSON, extract every named character and build a profile for each.
+Return ONLY a valid JSON array with NO markdown, NO code fences, NO explanation.
+Use exactly this structure:
+[
+  {
+    "character_id": "char_001",
+    "name": "actual character name",
+    "age_range": "e.g. 30s",
+    "gender": "male or female or other",
+    "personality_traits": ["trait1", "trait2", "trait3"],
+    "appearance": "detailed physical description suitable for image generation",
+    "costume": "what they wear",
+    "reference_style": "photorealistic",
+    "scenes_appeared": [1, 2, 3]
+  }
+]
+Fill ALL fields with real content based on the script. Do not use placeholder words."""
+
+    clean = _unwrap_llm_output(script_json)
+    return _llm(system, f"Extract characters from this screenplay:\n{clean}")
+
+
+@mcp.tool()
+def query_stock_footage(character_description: str) -> str:
+    """
+    Simulate querying a stock footage / reference library for character style references.
+    """
+    keywords = character_description.lower().split()[:5]
+    return json.dumps({
+        "query":      character_description,
+        "style_tags": keywords,
+        "references": [
+            {"source": "internal_style_library", "tag": "cinematic_portrait"},
+            {"source": "internal_style_library", "tag": "dramatic_lighting"},
+        ],
+        "suggested_prompt_suffix": "cinematic lighting, professional photography, 8k, highly detailed",
+    })
+
+
+# ─── Image Synthesis Tools ────────────────────────────────────────────────────
+
+@mcp.tool()
+def generate_character_image(character_name: str, appearance: str, style: str = "photorealistic") -> str:
+    """
+    Generate a character reference image.
+
+    Priority order:
+      1. Pollinations AI (free, no API key required)
+      2. Hugging Face Inference API — serves Stable Diffusion 3.5 / FLUX
+         (same models ComfyUI would run locally; accessed via HF for portability)
+      3. OpenAI DALL-E 3               — if OPENAI_API_KEY is set
+      4. Stub .txt file                — if all providers fail
+    """
+    import urllib.parse
+
+    safe_name = character_name.replace(" ", "_").lower()
+    out_path  = IMAGE_DIR / f"{safe_name}.png"
+
+    style_suffix = {
+        "photorealistic": "cinematic portrait, professional photography, 8k resolution, sharp focus",
+        "animated":       "2D animation style, vibrant colors, expressive, clean lines",
+        "painterly":      "oil painting style, dramatic lighting, artistic brushwork",
+    }.get(style, "cinematic portrait, 8k resolution")
+
+    full_prompt = (
+        f"Character portrait of {character_name}: {appearance}. "
+        f"{style_suffix}. Full character reference sheet, white background."
+    )
+
+    # ── 1. Pollinations AI (free, no API key needed) ──────
+    print(f"  [Pollinations] Generating image for {character_name}...")
+    try:
+        encoded_prompt = urllib.parse.quote(full_prompt)
+        poll_url = (
+            f"https://image.pollinations.ai/prompt/{encoded_prompt}"
+            f"?width=1024&height=1024&nologo=true&enhance=true"
+        )
+        resp = requests.get(poll_url, timeout=120)
+        if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image/"):
+            out_path.write_bytes(resp.content)
+            print(f"  [Pollinations] SUCCESS — {out_path}")
+            return json.dumps({
+                "status":    "success",
+                "provider":  "pollinations",
+                "character": character_name,
+                "file":      str(out_path),
+                "prompt":    full_prompt,
+            })
+        else:
+            print(f"  [Pollinations] Failed — HTTP {resp.status_code}: {resp.text[:200]}")
+    except requests.exceptions.Timeout:
+        print("  [Pollinations] Timed out after 120s — trying next provider")
+    except Exception as e:
+        print(f"  [Pollinations] Error: {e} — trying next provider")
+
+    # ── 2. Hugging Face (free) — Stable Diffusion 3.5 / FLUX ──
+    HF_MODELS = [
+        "black-forest-labs/FLUX.1-schnell",
+        "stabilityai/stable-diffusion-3.5-medium",
+        "runwayml/stable-diffusion-v1-5",
+    ]
+    hf_token = os.environ.get("HF_TOKEN")
+    if hf_token:
+        hf_success = False
+        for hf_model in HF_MODELS:
+            if hf_success:
+                break
+            hf_url = (
+                f"https://router.huggingface.co/hf-inference/models/"
+                f"{hf_model}/v1/text-to-image"
+            )
+            print(f"  [HF] Trying {hf_model}...")
+            for attempt in range(3):
+                try:
+                    resp = requests.post(
+                        hf_url,
+                        headers={
+                            "Authorization": f"Bearer {hf_token}",
+                            "Content-Type":  "application/json",
+                        },
+                        json={"inputs": full_prompt},
+                        timeout=120,
+                    )
+
+                    if resp.headers.get("content-type", "").startswith("image/"):
+                        out_path.write_bytes(resp.content)
+                        print(f"  [HF] SUCCESS — {out_path}")
+                        hf_success = True
+                        return json.dumps({
+                            "status":    "success",
+                            "provider":  "huggingface",
+                            "model":     hf_model,
+                            "character": character_name,
+                            "file":      str(out_path),
+                        })
+
+                    try:
+                        err_json = resp.json()
+                    except Exception:
+                        err_json = {"error": resp.text[:200]}
+
+                    error_msg = err_json.get("error", str(err_json)) if isinstance(err_json, dict) else str(err_json)
+                    estimated = err_json.get("estimated_time", 20)   if isinstance(err_json, dict) else 20
+
+                    if resp.status_code in (401, 403, 404, 410):
+                        print(f"  [HF] {hf_model} HTTP {resp.status_code}: {error_msg} — skipping model")
+                        break
+
+                    wait = min(float(estimated) + 5, 60)
+                    print(f"  [HF] {hf_model} loading (attempt {attempt+1}/3), waiting {wait:.0f}s... {error_msg}")
+                    time.sleep(wait)
+
+                except requests.exceptions.Timeout:
+                    print(f"  [HF] {hf_model} timed out (attempt {attempt+1}/3)")
+                except Exception as e:
+                    print(f"  [HF] {hf_model} error: {e} — skipping model")
+                    break
+
+    # ── 3. OpenAI DALL-E 3 ───────────────────────────────
+    openai_key = os.environ.get("OPENAI_API_KEY")
+    if openai_key:
+        try:
+            resp = requests.post(
+                "https://api.openai.com/v1/images/generations",
+                headers={
+                    "Authorization": f"Bearer {openai_key}",
+                    "Content-Type":  "application/json",
+                },
+                json={"model": "dall-e-3", "prompt": full_prompt, "n": 1, "size": "1024x1024"},
+                timeout=60,
+            )
+            resp.raise_for_status()
+            image_url = resp.json()["data"][0]["url"]
+            img_data  = requests.get(image_url, timeout=30).content
+            out_path.write_bytes(img_data)
+            return json.dumps({
+                "status":    "success",
+                "provider":  "openai",
+                "character": character_name,
+                "file":      str(out_path),
+                "url":       image_url,
+            })
+        except Exception as e:
+            print(f"  [OpenAI] Failed for {character_name}: {e} — writing stub…")
+
+    # ── 4. Stub fallback ─────────────────────────────────
+    stub_path = IMAGE_DIR / f"{safe_name}_stub.txt"
+    stub_path.write_text(
+        f"[IMAGE STUB]\n"
+        f"Character : {character_name}\n"
+        f"Style     : {style}\n"
+        f"Prompt    : {full_prompt}\n\n"
+        f"All image providers failed. Check your internet connection.\n"
+    )
+    return json.dumps({
+        "status":    "stub",
+        "provider":  "none",
+        "character": character_name,
+        "file":      str(stub_path),
+        "note":      "All providers failed. Check internet connection.",
+    })
+
+
+# ─── Memory Tools (ChromaDB Vector Store) ─────────────────────────────────────
+
+@mcp.tool()
+def commit_memory(key: str, value: str, category: str = "general") -> str:
+    """
+    Persist data to the shared vector memory store (ChromaDB).
+
+    Embeds the value, then upserts it keyed by a unique id. The original
+    `key` and `category` are stored as metadata, so retrieval can filter
+    by category or match by keyword / semantic similarity.
+
+    Args:
+        key:      Logical identifier for this memory entry.
+        value:    JSON string or text to store and embed.
+        category: Memory category — script | character | image | general
+    """
+    entry_id = str(uuid.uuid4())[:8]
+    timestamp = datetime.utcnow().isoformat()
+
+    try:
+        _memory_collection.add(
+            ids=[entry_id],
+            documents=[value],
+            metadatas=[{
+                "key":       key,
+                "category":  category,
+                "timestamp": timestamp,
+            }],
+        )
+        return json.dumps({
+            "status":   "committed",
+            "id":       entry_id,
+            "key":      key,
+            "category": category,
+            "backend":  "chromadb",
+        })
+    except Exception as e:
+        return json.dumps({
+            "status": "error",
+            "error":  f"ChromaDB commit failed: {e}",
+            "key":    key,
+        })
+
+
+@mcp.tool()
+def query_memory(category: str = "", keyword: str = "", limit: int = 20) -> str:
+    """
+    Query the shared vector memory store (ChromaDB).
+
+    If `keyword` is given, performs a semantic similarity search.
+    If only `category` is given, returns the most recent entries in that category.
+    If neither is given, returns the most recent entries overall.
+
+    Args:
+        category: Filter by category (script | character | image | general).
+        keyword:  Semantic search query — finds conceptually related entries.
+        limit:    Max number of results (default 20).
+    """
+    try:
+        where_filter = {"category": category} if category else None
+
+        if keyword:
+            results = _memory_collection.query(
+                query_texts=[keyword],
+                n_results=limit,
+                where=where_filter,
+            )
+            entries = []
+            ids      = (results.get("ids")       or [[]])[0]
+            docs     = (results.get("documents") or [[]])[0]
+            metas    = (results.get("metadatas") or [[]])[0]
+            dists    = (results.get("distances") or [[]])[0]
+            for i, doc_id in enumerate(ids):
+                entries.append({
+                    "id":        doc_id,
+                    "key":       metas[i].get("key")       if i < len(metas) else "",
+                    "category":  metas[i].get("category")  if i < len(metas) else "",
+                    "timestamp": metas[i].get("timestamp") if i < len(metas) else "",
+                    "value":     docs[i]                   if i < len(docs)  else "",
+                    "distance":  dists[i]                  if i < len(dists) else None,
+                })
+        else:
+            # No keyword — return recent entries, filtered by category if given.
+            results = _memory_collection.get(
+                where=where_filter,
+                limit=limit,
+            )
+            entries = []
+            ids   = results.get("ids")       or []
+            docs  = results.get("documents") or []
+            metas = results.get("metadatas") or []
+            for i, doc_id in enumerate(ids):
+                entries.append({
+                    "id":        doc_id,
+                    "key":       metas[i].get("key")       if i < len(metas) else "",
+                    "category":  metas[i].get("category")  if i < len(metas) else "",
+                    "timestamp": metas[i].get("timestamp") if i < len(metas) else "",
+                    "value":     docs[i]                   if i < len(docs)  else "",
+                })
+            entries.sort(key=lambda e: e.get("timestamp", ""), reverse=True)
+
+        return json.dumps({
+            "count":   len(entries),
+            "entries": entries,
+            "backend": "chromadb",
+        })
+    except Exception as e:
+        return json.dumps({
+            "status": "error",
+            "error":  f"ChromaDB query failed: {e}",
+            "count":  0,
+            "entries": [],
+        })
+
+
+# ─── Output Commit Tools ──────────────────────────────────────────────────────
+
+@mcp.tool()
+def save_scene_manifest(script_json: str) -> str:
+    """Save the finalized scene manifest JSON to outputs/scene_manifest.json."""
+    try:
+        clean = _unwrap_llm_output(script_json)
+        data  = json.loads(clean)
+
+        if not isinstance(data, dict) or "scenes" not in data:
+            return json.dumps({
+                "status": "error",
+                "error":  "Parsed payload is not a valid script object (missing 'scenes' key).",
+                "hint":   "Make sure you pass the output of generate_script_segment directly.",
+            })
+
+        data["generated_at"] = datetime.utcnow().isoformat()
+        _save_json(MANIFEST_FILE, data)
+        return json.dumps({
+            "status":      "saved",
+            "path":        str(MANIFEST_FILE),
+            "title":       data.get("title", "unknown"),
+            "scene_count": len(data["scenes"]),
+        })
+    except json.JSONDecodeError as e:
+        return json.dumps({"status": "error", "error": f"JSON decode failed: {e}"})
+    except Exception as e:
+        return json.dumps({"status": "error", "error": str(e)})
+
+
+@mcp.tool()
+def save_character_db(characters_json: str) -> str:
+    """Save the finalized character database to outputs/character_db.json."""
+    try:
+        clean = _unwrap_llm_output(characters_json)
+        data  = json.loads(clean)
+
+        if not isinstance(data, list):
+            return json.dumps({
+                "status": "error",
+                "error":  "Parsed payload is not a JSON array of characters.",
+                "hint":   "Make sure you pass the output of extract_characters directly.",
+            })
+
+        db = {"generated_at": datetime.utcnow().isoformat(), "characters": data}
+        _save_json(CHAR_DB_FILE, db)
+        return json.dumps({
+            "status": "saved",
+            "path":   str(CHAR_DB_FILE),
+            "count":  len(data),
+        })
+    except json.JSONDecodeError as e:
+        return json.dumps({"status": "error", "error": f"JSON decode failed: {e}"})
+    except Exception as e:
+        return json.dumps({"status": "error", "error": str(e)})
+
+
+# ─── Run ──────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    print(f"[Writer's Room MCP] ChromaDB collection: {_memory_collection.name}")
+    print(f"[Writer's Room MCP] Persist directory:   {CHROMA_DIR}")
+    print(f"[Writer's Room MCP] Existing entries:    {_memory_collection.count()}")
+    mcp.run(transport="streamable-http")

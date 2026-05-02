@@ -1,0 +1,41 @@
+# ─── Phase 1 + 2 + 3 ─────────────────────────────────────────
+langchain>=0.3.0
+langchain-mcp-adapters>=0.1.0
+langgraph>=0.2.50
+mcp>=1.0.0
+pydantic>=2.0
+httpx>=0.27
+
+# LLM providers (use whichever you have keys for)
+anthropic>=0.40.0
+openai>=1.50.0
+groq>=0.11.0  # optional fallback
+
+# ─── Phase 1: Image gen + memory ─────────────────────────────
+pillow>=10.0.0
+chromadb>=0.5.0
+
+# ─── Phase 2: TTS + audio ────────────────────────────────────
+gTTS>=2.5.0
+# Optional, heavier alternatives:
+# elevenlabs>=1.0.0
+# TTS>=0.22.0          # Coqui TTS
+# bark>=0.1.5
+
+# ─── Phase 3: Video gen + composition ────────────────────────
+opencv-python>=4.10.0
+numpy>=1.26
+moviepy>=1.0.3
+# ffmpeg must also be installed system-wide (not pip):
+#   apt install ffmpeg     /     brew install ffmpeg
+
+# ─── Phase 4: Web (placeholders) ─────────────────────────────
+fastapi>=0.115.0
+uvicorn>=0.30.0
+
+# ─── Phase 5: State management ───────────────────────────────
+# (sqlite3 is in stdlib)
+
+# ─── Dev / testing ───────────────────────────────────────────
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
