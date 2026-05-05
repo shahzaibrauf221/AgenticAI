@@ -164,7 +164,7 @@ def _unwrap_llm_output(raw: str) -> str:
 # ─── Scriptwriter Tools ───────────────────────────────────────────────────────
 
 @mcp.tool()
-def generate_script_segment(prompt: str, num_scenes: int = 3) -> str:
+def generate_script_segment(prompt: str, num_scenes: int = 1) -> str:
     """
     Generate a structured multi-scene screenplay from a user prompt.
     Returns a JSON string with scenes, dialogues, and visual cues.

@@ -66,7 +66,13 @@ def fanout_video(state: AgentState):
 
 
 def fanout_lipsync(state: AgentState):
-    """After barrier, fan out lip_sync per scene that has audio + face-swapped video."""
+    """
+    After barrier, fan out lip_sync per scene.
+
+    A scene is dispatched if it has face-swapped video AND (dialogue audio
+    OR a BGM file). Silent scenes (no dialogue) are NOT skipped — lip_sync_node
+    will use BGM as the audio track for them.
+    """
     scenes    = state.get("scenes", []) or []
     audios    = state.get("audio_tracks") or {}
     videos    = state.get("face_swapped_clips") or {}
@@ -78,7 +84,12 @@ def fanout_lipsync(state: AgentState):
         skey = str(sid)
         if sid in completed:
             continue
-        if skey in audios and skey in videos:
+        if skey not in videos:
+            continue   # No video = nothing to lip-sync onto
+        audio_entry = audios.get(skey, {})
+        has_dialogue = bool(audio_entry.get("files"))
+        has_bgm      = bool(audio_entry.get("bgm_file"))
+        if has_dialogue or has_bgm:
             sends.append(Send("lip_sync_node", {**state, "_current_scene": scene}))
 
     if not sends:

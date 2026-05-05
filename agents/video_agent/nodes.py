@@ -218,23 +218,27 @@ async def video_gen_node(state: AgentState) -> dict:
     scene = state.get("_current_scene", {})
     sid   = scene.get("scene_id")
     chars = scene.get("characters", [])
+    dialogue = [d for d in (scene.get("dialogue") or []) if isinstance(d, dict)]
 
     duration = max(3.0, sum(max(1, len(d.get("line", "").split())) / 2.5
-                            for d in scene.get("dialogue", []) if isinstance(d, dict)))
+                            for d in dialogue))
 
-    print(f"  [Video Gen    | scene {sid}] Rendering {duration:.1f}s base video...")
+    print(f"  [Video Gen    | scene {sid}] Rendering {duration:.1f}s base video"
+          f" ({len(dialogue)} dialogue line(s))...")
 
     raw = await _call_tool(
         "query_stock_footage",
         scene_id=sid, location=scene.get("location", ""),
         characters=chars, visual_cue=scene.get("scene_visual_cue", ""),
         duration_s=duration,
+        dialogue_json=json.dumps(dialogue),   # drives talking-head animation
     )
     base = _safe_parse(raw)
     base_video = base.get("file", "")
 
     payload = {"scene_id": sid, "base_video": base_video,
-               "duration_s": duration, "characters": chars}
+               "duration_s": duration, "characters": chars,
+               "speakers_animated": base.get("speakers_animated", 0)}
 
     await _call_tool(
         "commit_memory",
@@ -324,7 +328,15 @@ async def face_swap_node(state: AgentState) -> dict:
 # ─── Node 4: Lip Sync ─────────────────────────────────────────────────────────
 
 async def lip_sync_node(state: AgentState) -> dict:
-    """PDF §5.5 — align Phase 2's mixed audio to face-swapped video."""
+    """
+    PDF §5.5 — align Phase 2's mixed audio to face-swapped video.
+
+    Three cases:
+      • Has dialogue → mux dialogue+BGM mix (scene_NN_full.wav)
+      • Silent scene → mux BGM-only (also already at scene_NN_full.wav, copied
+                                     from BGM by Phase 2's voice_synth_node)
+      • No audio at all → skip (rare, only if Phase 2 BGM also failed)
+    """
     scene = state.get("_current_scene", {})
     sid   = scene.get("scene_id")
     skey  = str(sid)
@@ -332,7 +344,9 @@ async def lip_sync_node(state: AgentState) -> dict:
     audio_entry = (state.get("audio_tracks") or {}).get(skey, {})
     video_entry = (state.get("face_swapped_clips") or {}).get(skey, {})
 
-    audio_files = audio_entry.get("files", [])
+    audio_files = audio_entry.get("files", []) or []
+    bgm_file    = audio_entry.get("bgm_file", "")
+    is_silent   = audio_entry.get("is_silent", False) or (not audio_files and bool(bgm_file))
     video_file  = video_entry.get("face_swapped_file", "")
 
     if not video_file:
@@ -342,23 +356,35 @@ async def lip_sync_node(state: AgentState) -> dict:
                                     "reason": "no video"}},
         }
 
-    if not audio_files:
-        print(f"  [Lip Sync     | scene {sid}] ⚠ No audio — skipping")
+    # Choose what to feed lip_sync_aligner
+    if audio_files:
+        track_list = audio_files
+        track_kind = "dialogue+bgm"
+    elif bgm_file:
+        track_list = [bgm_file]
+        track_kind = "bgm-only"
+    else:
+        print(f"  [Lip Sync     | scene {sid}] ⚠ No audio at all — skipping")
         return {
             "final_scenes": {skey: {"scene_id": sid, "status": "skipped",
-                                    "reason": "no audio"}},
+                                    "reason": "no audio (dialogue and bgm both missing)"}},
         }
 
-    print(f"  [Lip Sync     | scene {sid}] Aligning audio + video...")
+    print(f"  [Lip Sync     | scene {sid}] Aligning audio ({track_kind}) + video"
+          f"{' [silent scene]' if is_silent else ''}...")
 
     raw = await _call_tool(
         "lip_sync_aligner",
-        scene_id=sid, video_path=video_file, audio_files=audio_files,
+        scene_id=sid, video_path=video_file, audio_files=track_list,
     )
     try:
         result = _safe_parse(raw)
     except Exception as e:
         result = {"status": "error", "error": str(e), "scene_id": sid}
+
+    result["track_kind"] = track_kind
+    if is_silent:
+        result["silent_scene"] = True
 
     await _call_tool(
         "commit_memory",
@@ -369,7 +395,7 @@ async def lip_sync_node(state: AgentState) -> dict:
     score = result.get("lip_sync_score", 0)
     dur   = result.get("duration_s", 0)
     print(f"  [Lip Sync     | scene {sid}] ✓ {result.get('file', 'N/A')}  "
-          f"(score={score}, {dur}s)")
+          f"({track_kind}, score={score}, {dur}s)")
 
     return {"final_scenes": {skey: result}}
 

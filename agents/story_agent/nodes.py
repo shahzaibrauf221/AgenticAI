@@ -446,8 +446,63 @@ async def image_node(state: AgentState) -> dict:
 
         print(f"  [{img_result.get('status', 'unknown')}] {name} -> {img_result.get('file', 'N/A')}")
 
+    # ── Scene background images ───────────────────────────────────────────────
+    print("[Image Synthesizer] Generating scene background images...")
+    script = state.get("script", {}) or {}
+    scenes = script.get("scenes", []) or []
+    scene_images: list = []
+
+    for s in scenes:
+        if not isinstance(s, dict):
+            continue
+        sid       = s.get("scene_id")
+        location  = s.get("location", "")
+        time_of_day = s.get("time_of_day", "")
+        action    = s.get("action_description", "")
+        cue       = s.get("scene_visual_cue", "")
+        tone      = s.get("tone", "neutral")
+
+        # Build a rich, paintable prompt for the scene
+        scene_prompt = (
+            f"Cinematic wide shot of {location}, {time_of_day}. "
+            f"{cue}. {action}. Mood: {tone}. "
+            f"Photorealistic, atmospheric lighting, no people, "
+            f"establishing shot, 16:9 aspect ratio."
+        ).strip()
+
+        print(f"  Scene {sid} background: {location[:40]}...")
+
+        # Reuse the same MCP tool — we just pass the scene as a "character"
+        # named scene_NN so the server stores it under that filename.
+        scene_key = f"scene_{sid:02d}" if isinstance(sid, int) else f"scene_{sid}"
+        raw = await _call_tool(
+            "generate_character_image",
+            character_name=scene_key,
+            appearance=scene_prompt,
+            style="cinematic photorealistic",
+        )
+        try:
+            img_result = _safe_parse(raw)
+            img_result = _to_dict(img_result, {"status": "error", "scene_id": sid})
+        except Exception:
+            img_result = {"status": "error", "scene_id": sid, "raw": raw}
+
+        img_result["scene_id"] = sid
+        img_result["scene_key"] = scene_key
+        scene_images.append(img_result)
+
+        await _call_tool(
+            "commit_memory",
+            key=f"scene_image_{scene_key}",
+            value=json.dumps(img_result),
+            category="scene_image",
+        )
+
+        print(f"  [{img_result.get('status', 'unknown')}] scene {sid} -> {img_result.get('file', 'N/A')}")
+
     return {
         "images":       new_images,
+        "scene_images": scene_images,
         "status":       "processing",
         "current_node": "image_node",
     }

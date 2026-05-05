@@ -254,6 +254,11 @@ async def voice_synth_node(state: AgentState) -> dict:
       2. Synthesizes each dialogue line via TTS with that profile
       3. Generates mood-appropriate BGM (from scene.tone)
       4. Pre-mixes dialogue + BGM → scene_NN_full.wav
+
+    Silent-dialogue handling:
+      Even when the scene has no dialogue, we still generate BGM matching the
+      scene's tone for the scene's intended duration, and we copy that BGM
+      to scene_NN_full.wav so Phase 3's lip_sync_aligner has audio to mux.
     """
     scene = state.get("_current_scene", {})
     sid   = scene.get("scene_id")
@@ -292,11 +297,23 @@ async def voice_synth_node(state: AgentState) -> dict:
         except Exception as e:
             print(f"    [Voice Synth | scene {sid}] line failed: {e}")
 
-    # Generate BGM
+    # ── Silent scene? Use the scene's planned duration so we still get BGM ──
+    is_silent_scene = (total_duration == 0.0)
+    if is_silent_scene:
+        # Prefer scene.duration_s from Phase 1 spec output; otherwise estimate
+        # from action description length (≈ 8 seconds per "beat").
+        planned = float(scene.get("duration_s", 0) or 0)
+        if planned <= 0:
+            action_words = len((scene.get("action_description") or "").split())
+            planned = max(5.0, min(20.0, action_words / 3.0 + 4.0))
+        total_duration = planned
+        print(f"  [Voice Synth  | scene {sid}] ⓘ Silent scene — planning {planned:.1f}s of BGM only")
+
+    # Generate BGM (always, even for silent scenes)
     bgm_file = ""
     if total_duration > 0:
         try:
-            print(f"  [BGM          | scene {sid}] Generating {mood} music...")
+            print(f"  [BGM          | scene {sid}] Generating {mood} music ({total_duration:.1f}s)...")
             raw = await _call_tool(
                 "generate_background_music",
                 scene_id=sid, mood=mood, duration_s=total_duration,
@@ -307,8 +324,9 @@ async def voice_synth_node(state: AgentState) -> dict:
         except Exception as e:
             print(f"  [BGM          | scene {sid}] failed: {e}")
 
-    # Mix dialogue + BGM → scene_NN_full.wav
+    # ── Build scene_NN_full.wav (the audio track Phase 3 muxes) ──────────────
     if audio_files and bgm_file:
+        # Normal case: dialogue + BGM mix
         try:
             print(f"  [Mix          | scene {sid}] dialogue + BGM (BGM @ -18dB)...")
             await _call_tool(
@@ -318,6 +336,15 @@ async def voice_synth_node(state: AgentState) -> dict:
             )
         except Exception as e:
             print(f"  [Mix          | scene {sid}] failed: {e}")
+    elif is_silent_scene and bgm_file:
+        # Silent scene: use BGM as the full track so Phase 3 still produces a video
+        try:
+            import shutil as _shutil
+            target = Path(bgm_file).parent / f"scene_{sid:02d}_full.wav"
+            _shutil.copyfile(bgm_file, target)
+            print(f"  [Mix          | scene {sid}] silent → copied BGM as full track")
+        except Exception as e:
+            print(f"  [Mix          | scene {sid}] could not stage silent BGM: {e}")
 
     payload = {
         "scene_id":       sid,
@@ -325,6 +352,7 @@ async def voice_synth_node(state: AgentState) -> dict:
         "bgm_file":       bgm_file,
         "mood":           mood,
         "total_duration": round(total_duration, 2),
+        "is_silent":      is_silent_scene,
         "voice_profiles": {k: v for k, v in profiles_used.items()},
     }
 
@@ -335,10 +363,10 @@ async def voice_synth_node(state: AgentState) -> dict:
         category="audio_track",
     )
 
-    profiles_summary = ", ".join(
+    profiles_summary = (", ".join(
         f"{k}({v['emotion']},{v['tld']})" for k, v in profiles_used.items()
-    )
-    print(f"  [Voice Synth  | scene {sid}] ✓ {len(audio_files)} clip(s), "
+    ) or "BGM-only")
+    print(f"  [Voice Synth  | scene {sid}] ✓ {len(audio_files)} dialogue clip(s), "
           f"{total_duration:.1f}s  [{profiles_summary}]  mood={mood}")
 
     return {"audio_tracks": {str(sid): payload}}

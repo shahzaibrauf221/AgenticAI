@@ -24,7 +24,8 @@ class AgentState(TypedDict):
 
     # ── Characters & Images ────────────────────────────────
     characters:   list[dict]                   # character profiles
-    images:       Annotated[list, operator.add] # accumulated image results
+    images:       Annotated[list, operator.add] # accumulated character image results
+    scene_images: Annotated[list, operator.add] # accumulated scene background image results
 
     # ── Pipeline control ───────────────────────────────────
     status:       str                          # "processing" | "awaiting_review" | "complete" | "failed"
