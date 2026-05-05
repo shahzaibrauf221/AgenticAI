@@ -51,3 +51,7 @@ htmlcov/
 # Frontend
 node_modules/
 .next/
+
+
+commands.txt
+implementation_plan.md

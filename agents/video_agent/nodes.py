@@ -17,11 +17,14 @@
 
 import asyncio
 import json
+import math
 import os
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+
+from moviepy import VideoFileClip, vfx
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
@@ -95,9 +98,34 @@ def _safe_filename_part(s: str) -> str:
     return "".join(c if c.isalnum() or c in "-_" else "_" for c in s).lower()
 
 
-def _expected_base_video_path(scene_id: int, location: str) -> Path:
-    """Mirror studio_floor_server's output convention."""
+def _get_duration(file_path: str) -> float:
+    """Return duration in seconds of a media file via ffprobe, default 5.0."""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(file_path)],
+            capture_output=True, text=True, timeout=10,
+        )
+        return float(r.stdout.strip())
+    except Exception:
+        return 5.0
+
+
+def _expected_base_video_path(scene_id: int, location: str = "") -> Path:
+    """Locate the base video for a scene.
+
+    Strategy (in order):
+      1. Glob VIDEO_DIR for scene_{scene_id:02d}_*.mp4 — works regardless of
+         what slug was used to name the file (prompt-based or location-based).
+      2. Fall back to the old location-derived filename so the function
+         remains backwards-compatible when called with a known path.
+    """
     base_dir = Path(__file__).resolve().parent.parent.parent / "outputs" / "video"
+    # Prefer an exact match on disk (handles prompt-named files correctly)
+    matches = sorted(base_dir.glob(f"scene_{scene_id:02d}_*.mp4"))
+    if matches:
+        return matches[0]  # first alphabetically; there should only be one per scene
+    # Legacy fallback: reconstruct from location (may not exist yet)
     safe_loc = _safe_filename_part(location[:40]) if location else f"scene_{scene_id}"
     return base_dir / f"scene_{scene_id:02d}_{safe_loc}.mp4"
 
@@ -123,7 +151,7 @@ _WORDS_PER_SECOND    = 2.3    # typical voiced narration pace
 _ACTION_BEAT_SECONDS = 3.0    # pause budget per action/visual beat line
 _INTER_LINE_GAP      = 0.6    # reaction pause between dialogue lines
 _TRANSITION_PAD      = 1.5    # lead-in + lead-out breathing room per scene
-_MIN_SCENE_DURATION  = 6.0    # never shorter than this (seconds)
+_MIN_SCENE_DURATION  = 0.5    # allow short scenes when audio is short
 _MAX_SCENE_DURATION  = 180.0  # hard cap to prevent runaway scenes
 
 
@@ -194,6 +222,136 @@ def _compute_scene_duration(scene: dict) -> float:
     total += _TRANSITION_PAD
 
     return max(_MIN_SCENE_DURATION, min(_MAX_SCENE_DURATION, total))
+
+
+def _duration_from_state(state: AgentState, scene_id) -> float:
+    """
+    Resolve scene audio duration in priority order:
+      1) Phase 2 timing_manifest-derived per-scene map
+      2) Phase 2 audio_tracks[scene_id].total_duration
+      3) 0.0 (caller fallback)
+    """
+    sid = str(scene_id)
+    by_scene = state.get("scene_audio_durations") or {}
+    if sid in by_scene:
+        try:
+            val = float(by_scene[sid])
+            if val > 0:
+                return val
+        except (TypeError, ValueError):
+            pass
+
+    audio_entry = (state.get("audio_tracks") or {}).get(sid, {})
+    try:
+        val = float(audio_entry.get("total_duration", 0.0) or 0.0)
+        if val > 0:
+            return val
+    except (TypeError, ValueError):
+        pass
+    return 0.0
+
+
+def _build_scene_duration_map(timing_manifest: dict) -> dict:
+    """Aggregate timing_manifest segments into per-scene durations (seconds)."""
+    per_scene_ms: dict[str, int] = {}
+    for seg in timing_manifest.get("segments", []) or []:
+        if not isinstance(seg, dict):
+            continue
+        sid = seg.get("scene_id")
+        if sid is None:
+            continue
+        start_ms = int(seg.get("start_ms", 0) or 0)
+        end_ms = int(seg.get("end_ms", 0) or 0)
+        seg_ms = max(0, end_ms - start_ms)
+        if seg_ms <= 0:
+            continue
+        skey = str(sid)
+        per_scene_ms[skey] = per_scene_ms.get(skey, 0) + seg_ms
+    return {sid: round(ms / 1000.0, 3) for sid, ms in per_scene_ms.items() if ms > 0}
+
+
+def _sync_clip_duration(raw_video: str, target_duration: float) -> str:
+    """
+    Loop or trim raw video so visual length exactly matches target_duration.
+    Returns the synced file path (or raw_video if sync fails).
+    """
+    if not raw_video or target_duration <= 0:
+        return raw_video
+
+    raw_path = Path(raw_video)
+    if not raw_path.exists():
+        return raw_video
+
+    synced_path = str(raw_path.with_name(f"{raw_path.stem}_synced.mp4"))
+    clip = None
+    synced = None
+    try:
+        clip = VideoFileClip(raw_video)
+        if clip.duration <= 0:
+            return raw_video
+
+        fps = clip.fps or 8
+        if target_duration < clip.duration:
+            synced = clip.subclipped(0, target_duration)
+        else:
+            loops = max(1, math.ceil(target_duration / clip.duration))
+            synced = clip.with_effects([vfx.Loop(n=loops)]).subclipped(0, target_duration)
+
+        synced.write_videofile(synced_path, fps=fps, logger=None)
+        return synced_path
+    except Exception:
+        return raw_video
+    finally:
+        try:
+            if synced is not None:
+                synced.close()
+        except Exception:
+            pass
+        try:
+            if clip is not None:
+                clip.close()
+        except Exception:
+            pass
+
+
+def _concat_video_shots(shot_paths: list[str], out_path: Path) -> str:
+    """Concatenate multiple generated shots into one scene clip."""
+    valid = [p for p in shot_paths if p and Path(p).exists()]
+    if not valid:
+        return ""
+    if len(valid) == 1:
+        return valid[0]
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if not _has_ffmpeg():
+        return valid[0]
+
+    concat_txt = out_path.with_suffix(".concat.txt")
+    concat_txt.write_text(
+        "\n".join(f"file '{Path(p).resolve()}'" for p in valid) + "\n",
+        encoding="utf-8",
+    )
+    try:
+        proc = subprocess.run(
+            [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-f", "concat", "-safe", "0",
+                "-i", str(concat_txt),
+                "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                str(out_path),
+            ],
+            capture_output=True, text=True, timeout=240,
+        )
+        if proc.returncode == 0 and out_path.exists():
+            return str(out_path)
+    except Exception:
+        pass
+    finally:
+        try:
+            concat_txt.unlink(missing_ok=True)
+        except Exception:
+            pass
+    return valid[0]
 
 
 # ─── Background image + ambient audio helpers ────────────────────────────────
@@ -417,6 +575,10 @@ async def scene_loader_node(state: AgentState) -> dict:
                      if state.get("script_path")
                      else (manifest_path.parent / "script.json"))
 
+    import random
+    seed = state.get("global_seed") or random.randint(1, 2147483647)
+    print(f"[Scene Loader] Global Seed: {seed}")
+
     manifest = None
     char_db  = None
 
@@ -449,6 +611,28 @@ async def scene_loader_node(state: AgentState) -> dict:
     scenes = manifest.get("scenes", [])
     print(f"[Scene Loader] {len(scenes)} scenes, "
           f"{len(char_db.get('characters', []))} characters")
+
+    # Load Phase 2 timing_manifest.json for precise A/V duration sync.
+    timing_manifest = {}
+    scene_audio_durations = {}
+    timing_candidates = []
+    if script_path:
+        timing_candidates.append(script_path.parent / "timing_manifest.json")
+    if manifest_path:
+        timing_candidates.append(manifest_path.parent / "timing_manifest.json")
+    explicit_timing = state.get("timing_manifest_path")
+    if explicit_timing:
+        timing_candidates.insert(0, Path(explicit_timing))
+    for candidate in timing_candidates:
+        if candidate and candidate.exists():
+            try:
+                timing_manifest = json.loads(candidate.read_text(encoding="utf-8"))
+                scene_audio_durations = _build_scene_duration_map(timing_manifest)
+                print(f"[Scene Loader] timing_manifest loaded: {candidate} "
+                      f"({len(scene_audio_durations)} scene durations)")
+                break
+            except Exception as e:
+                print(f"[Scene Loader] timing_manifest unreadable at {candidate}: {e}")
 
     # Pull Phase 2 audio results from MCP memory if not in state
     audio_tracks = dict(state.get("audio_tracks") or {})
@@ -493,14 +677,35 @@ async def scene_loader_node(state: AgentState) -> dict:
         except Exception:
             pass
 
+    # ── Clear stale per-scene MP4s from previous runs ────────────────────────
+    # Old PIL-rendered clips (640x360@12fps) MUST be removed so the face_swapper
+    # and compositor don't accidentally pick them up instead of fresh Kaggle
+    # outputs (768x512@24fps).  The final_output.mp4 in outputs/final/ is NOT
+    # deleted here so the user can always view the last successful run.
+    _video_dir  = Path(__file__).resolve().parent.parent.parent / "outputs" / "video"
+    _scenes_dir = Path(__file__).resolve().parent.parent.parent / "outputs" / "raw_scenes"
+    _removed = 0
+    for _d in (_video_dir, _scenes_dir):
+        for _f in _d.glob("*.mp4"):
+            try:
+                _f.unlink()
+                _removed += 1
+            except OSError:
+                pass
+    if _removed:
+        print(f"[Scene Loader] Cleared {_removed} stale MP4(s) from previous run")
+
     return {
         "scene_manifest":      manifest,
         "character_db":        char_db,
         "audio_tracks":        audio_tracks,
+        "timing_manifest":     timing_manifest,
+        "scene_audio_durations": scene_audio_durations,
         "task_graph":          task_graph,
         "scenes":              scenes,
         "completed_scene_ids": completed_ids,
-        "status":              "processing",
+        "global_seed":         seed,
+        "status":              "scenes_loaded",
         "current_node":        "scene_loader_node",
     }
 
@@ -511,17 +716,39 @@ async def video_gen_node(state: AgentState) -> dict:
     """
     Generate base video for one scene.
 
-    Duration is computed from ALL available scene data:
-      explicit duration_s  >  dialogue word count  >  action beats
-      >  description narration  >  visual cue cuts  >  transition padding.
+    Duration priority:
+      1. Phase 2 actual audio duration (from audio_tracks in state)
+      2. Heuristic fallback via _compute_scene_duration()
+      3. Minimum floor of _MIN_SCENE_DURATION (6.0s)
 
-    This ensures the video is long enough to hold all content comfortably.
+    Sends only (scene_id, prompt, duration_s) to the remote SD 1.5 + MoviePy
+    GPU worker, or the clean local fallback renderer.
     """
-    scene = state.get("_current_scene", {})
+    scene = state.get("_current_scene")
+    if not scene:
+        # Find first ungenerated scene
+        scenes = sorted(state.get("scenes", []), key=lambda x: x.get("scene_id"))
+        clips = state.get("video_clips") or {}
+        for s in scenes:
+            if str(s.get("scene_id")) not in clips:
+                scene = s
+                break
+    
+    if not scene:
+        print("  [Video Gen] No more scenes to generate.")
+        return {}
+
     sid   = scene.get("scene_id")
     chars = scene.get("characters", [])
 
-    duration = _compute_scene_duration(scene)
+    # ── Priority 1: Phase 2 timing manifest / audio durations ────────────────
+    resolved_audio_duration = _duration_from_state(state, sid)
+    if resolved_audio_duration > 0:
+        duration = max(_MIN_SCENE_DURATION, float(resolved_audio_duration))
+        print(f"  [Video Gen    | scene {sid}] Using audio duration: {duration:.2f}s")
+    else:
+        duration = _compute_scene_duration(scene)
+        print(f"  [Video Gen    | scene {sid}] No audio track — heuristic duration: {duration:.1f}s")
 
     n_dialogue = len(scene.get("dialogue", []) or [])
     n_actions  = len(scene.get("actions", [])
@@ -529,18 +756,102 @@ async def video_gen_node(state: AgentState) -> dict:
     print(f"  [Video Gen    | scene {sid}] Rendering {duration:.1f}s "
           f"({n_dialogue} dialogue lines, {n_actions} action beats)")
 
-    raw = await _call_tool(
-        "query_stock_footage",
-        scene_id=sid,
-        location=scene.get("location", ""),
-        characters=chars,
-        visual_cue=scene.get("scene_visual_cue", "") or scene.get("visual_cue", ""),
-        duration_s=duration,
-        mood=scene.get("mood", "") or scene.get("tone", ""),
-        description=scene.get("description", "") or scene.get("scene_description", ""),
-    )
-    base = _safe_parse(raw)
-    base_video = base.get("file", "")
+    # ── Build a rich SD prompt from all available scene metadata ──────────────
+    prompt_parts = []
+    
+    # 1. Identify primary speaking character
+    speaker = None
+    if scene.get("dialogue"):
+        speaker = scene["dialogue"][0]["speaker"]
+    elif chars:
+        speaker = chars[0]
+        
+    char_db = state.get("character_db", {}).get("characters", [])
+    char_map = {c["name"]: c for c in char_db}
+    
+    # 2. Frame the shot around the speaker so Wav2Lip has a face, but keep it a medium shot
+    if speaker and speaker in char_map:
+        cinfo = char_map[speaker]
+        appearance = cinfo.get("appearance", "")
+        costume = cinfo.get("costume", "")
+        # Medium shot avoids "huge floating faces" by including the upper body
+        prompt_parts.append(
+            f"Cinematic medium shot of {speaker}, {appearance}, wearing {costume}, "
+            "standing in scene, speaking"
+        )
+    elif chars:
+        prompt_parts.append(f"Cinematic medium shot of a person standing in scene")
+
+    # 3. Add ONLY the pure visual background cue, avoid abstract action descriptions
+    visual_cue = scene.get("scene_visual_cue", "") or scene.get("visual_cue", "")
+    if visual_cue:
+        prompt_parts.append(f"Background: {visual_cue}")
+        
+    location = scene.get("location", "")
+    if location:
+        prompt_parts.append(f"set in {location}")
+        
+    mood = scene.get("mood", "") or scene.get("tone", "")
+    if mood:
+        prompt_parts.append(f"{mood} atmosphere")
+    
+    # Keep prompt physically descriptive and character-consistent.
+    prompt_text = ", ".join(prompt_parts) if prompt_parts else f"cinematic scene at {location or 'unknown location'}"
+    neg_prompt = "morphed face, distorted anatomy, extra limbs, low resolution, blurry, mutated"
+    
+    seed = state.get("global_seed", -1)
+    init_image = state.get("last_scene_frame_b64", "")
+    denoising = 0.38 if init_image else 0.0
+
+    # Build scene from multiple fresh generated shots (instead of one looped clip).
+    shot_target_s = max(1.5, float(os.getenv("SHOT_DURATION_S", "2.0") or 2.0))
+    shot_count = max(1, min(24, math.ceil(duration / shot_target_s)))
+    shot_files: list[str] = []
+    for i in range(shot_count):
+        # Vary seed and camera framing text to avoid visual repetition.
+        shot_seed = (int(seed) + i * 97) if isinstance(seed, int) and seed >= 0 else -1
+        shot_prompt = f"{prompt_text}, shot {i + 1}/{shot_count}, cinematic continuity"
+        raw = await _call_tool(
+            "query_stock_footage",
+            scene_id=sid,
+            prompt=shot_prompt,
+            num_frames=16,
+            width=512,
+            height=512,
+            seed=shot_seed,
+            negative_prompt=neg_prompt,
+            denoising_strength=0.15 if i > 0 else denoising,
+            init_image_b64=init_image if i == 0 else "",
+        )
+        base = _safe_parse(raw)
+        shot_file = base.get("file", "")
+        if shot_file and Path(shot_file).exists():
+            shot_files.append(shot_file)
+
+    sid_num = int(sid) if str(sid).isdigit() else 0
+    stitched_path = Path(__file__).resolve().parent.parent.parent / "outputs" / "video" / f"scene_{sid_num:02d}_stitched.mp4"
+    raw_video = _concat_video_shots(shot_files, stitched_path)
+
+    # Final trim/fit to exact target audio duration.
+    base_video = _sync_clip_duration(raw_video, duration) if raw_video else raw_video
+
+    # Extract last frame for temporal consistency in NEXT scene
+    last_frame_b64 = ""
+    try:
+        import base64
+        import PIL.Image
+        import io
+        import numpy as np
+        # Open final base_video to get the last frame
+        tmp_clip = VideoFileClip(base_video)
+        last_frame_arr = tmp_clip.get_frame(tmp_clip.duration - 0.1)
+        img = PIL.Image.fromarray(last_frame_arr.astype('uint8'))
+        buffered = io.BytesIO()
+        img.save(buffered, format="PNG")
+        last_frame_b64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+        tmp_clip.close()
+    except Exception as e:
+        print(f"  [Video Gen    | scene {sid}] ⚠ Failed to extract last frame: {e}")
 
     payload = {
         "scene_id":   sid,
@@ -557,7 +868,10 @@ async def video_gen_node(state: AgentState) -> dict:
     )
 
     print(f"  [Video Gen    | scene {sid}] ✓ {base_video} ({duration:.1f}s)")
-    return {"video_clips": {str(sid): payload}}
+    return {
+        "video_clips": {str(sid): payload},
+        "last_scene_frame_b64": last_frame_b64
+    }
 
 
 # ─── Node 3: Face Swap ────────────────────────────────────────────────────────
@@ -579,9 +893,17 @@ async def face_swap_node(state: AgentState) -> dict:
     )
     validation = _safe_parse(raw)
 
+    # Prefer the path already committed by video_gen_node (authoritative source).
+    # Fall back to disk-scan helper only when running face-swap in isolation.
+    video_clip_entry = (state.get("video_clips") or {}).get(skey, {})
+    stored_path = video_clip_entry.get("base_video", "")
+    if stored_path and Path(stored_path).exists():
+        expected = Path(stored_path)
+    else:
+        expected = _expected_base_video_path(sid, location)
+
     if not validation.get("valid"):
         print(f"  [Face Swap    | scene {sid}] ✗ Identity FAILED: {validation.get('reason')}")
-        expected = _expected_base_video_path(sid, location)
         await _wait_for_file(expected, timeout_s=120.0)
         payload = {
             "scene_id": sid, "base_video": str(expected),
@@ -596,7 +918,6 @@ async def face_swap_node(state: AgentState) -> dict:
         )
         return {"face_swapped_clips": {skey: payload}}
 
-    expected = _expected_base_video_path(sid, location)
     print(f"  [Face Swap    | scene {sid}] ✓ Identity verified — waiting for base video...")
     if not await _wait_for_file(expected, timeout_s=120.0):
         print(f"  [Face Swap    | scene {sid}] ✗ Base video never appeared at {expected}")
@@ -662,7 +983,7 @@ async def lip_sync_node(state: AgentState) -> dict:
     audio_files = audio_entry.get("files", [])
     video_file  = video_entry.get("face_swapped_file", "")
 
-    duration = _compute_scene_duration(scene)
+    duration = _duration_from_state(state, sid) or _compute_scene_duration(scene)
 
     out_dir = Path(__file__).resolve().parent.parent.parent / "outputs" / "final"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -851,30 +1172,89 @@ async def compositor_node(state: AgentState) -> dict:
         encoding="utf-8",
     )
 
+    # ── Compose a filter_complex that normalises every clip to 1280x720@24fps
+    # then concatenates them.  This is robust to mixed resolutions / frame-rates
+    # (e.g. 640x360@12fps PIL clips vs 768x512@24fps Kaggle clips).
+    TARGET_W, TARGET_H, TARGET_FPS = 1280, 720, 24
+
+    n = len(scene_files)
+    # Build -i args and filter_complex string
+    input_args = []
+    for f in scene_files:
+        input_args += ["-i", f]
+
+    # ── Probe each file for audio stream presence ─────────────────────────────
+    # Clips coming from Kaggle /face_swap have no audio; clips from lip_sync_aligner do.
+    # Using [i:a:0] on an audio-less file crashes the entire filter_complex.
+    has_audio_list = []
+    for f in scene_files:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=codec_type", "-of", "csv=p=0", f],
+            capture_output=True, text=True,
+        )
+        has_audio_list.append(bool(probe.stdout.strip()))
+
+    # Scale+fps filter for each video input, then concat
+    filter_parts = []
+    for i in range(n):
+        filter_parts.append(
+            f"[{i}:v]scale={TARGET_W}:{TARGET_H}:force_original_aspect_ratio=decrease,"
+            f"pad={TARGET_W}:{TARGET_H}:(ow-iw)/2:(oh-ih)/2,"
+            f"fps={TARGET_FPS}[v{i}];"
+        )
+    video_labels = "".join(f"[v{i}]" for i in range(n))
+    filter_parts.append(f"{video_labels}concat=n={n}:v=1:a=0[vout];")
+
+    # Audio: use the real audio stream if present, else synthesise silence
+    audio_filter_parts = []
+    for i in range(n):
+        if has_audio_list[i]:
+            audio_filter_parts.append(f"[{i}:a:0]aresample=44100[a{i}];")
+        else:
+            audio_filter_parts.append(
+                f"anullsrc=r=44100:cl=stereo,atrim=0:{_get_duration(scene_files[i])}[a{i}];"
+            )
+    audio_labels = "".join(f"[a{i}]" for i in range(n))
+    audio_filter_parts.append(f"{audio_labels}concat=n={n}:v=0:a=1[aout]")
+
+    full_filter = "".join(filter_parts) + "".join(audio_filter_parts)
+
     cmd = [
-        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-        "-i", str(concat_list),
-        "-c", "copy",
+        "ffmpeg", "-y",
+        *input_args,
+        "-filter_complex", full_filter,
+        "-map", "[vout]", "-map", "[aout]",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-c:a", "aac", "-b:a", "192k",
+        "-movflags", "+faststart",
         str(final_path),
     ]
 
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if proc.returncode != 0:
-            print(f"  [Compositor] copy failed, re-encoding...")
-            cmd_re = [
-                "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-                "-i", str(concat_list),
-                "-c:v", "libx264", "-preset", "fast",
-                "-c:a", "aac", "-b:a", "192k",
+            # Fallback: try without audio (some clips may have no audio stream)
+            print(f"  [Compositor] audio concat failed: {proc.stderr[-400:]}")
+            print(f"  [Compositor] retrying video-only...")
+            # Rebuild without audio concat
+            v_only_filter = "".join(filter_parts)  # just [v0][v1]...concat[vout]
+            cmd_vonly = [
+                "ffmpeg", "-y",
+                *input_args,
+                "-filter_complex", v_only_filter,
+                "-map", "[vout]",
+                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                "-an",
+                "-movflags", "+faststart",
                 str(final_path),
             ]
-            proc = subprocess.run(cmd_re, capture_output=True, text=True, timeout=600)
+            proc = subprocess.run(cmd_vonly, capture_output=True, text=True, timeout=600)
             if proc.returncode != 0:
                 return {
                     "status":       "failed",
                     "current_node": "compositor_node",
-                    "errors":       [f"ffmpeg concat failed: {proc.stderr[-500:]}"],
+                    "errors":       [f"ffmpeg concat failed: {proc.stderr[-600:]}"],
                 }
     except subprocess.TimeoutExpired:
         return {
@@ -882,11 +1262,6 @@ async def compositor_node(state: AgentState) -> dict:
             "current_node": "compositor_node",
             "errors":       ["ffmpeg concat timed out"],
         }
-    finally:
-        try:
-            concat_list.unlink()
-        except Exception:
-            pass
 
     print(f"  [Compositor] ✓ {final_path}  "
           f"({final_path.stat().st_size / (1024*1024):.1f} MB)")

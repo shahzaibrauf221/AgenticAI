@@ -45,6 +45,9 @@ class AgentState(TypedDict, total=False):
     # If running Phase 3 standalone, it's loaded from MCP memory or the
     # phase2_audio_summary.json file.
     audio_tracks:         Annotated[dict, _merge_dict]
+    timing_manifest_path: str
+    timing_manifest:      dict
+    scene_audio_durations: Annotated[dict, _merge_dict]
 
     # ── Task graph ────────────────────────────────────────
     task_graph:           dict
@@ -62,6 +65,10 @@ class AgentState(TypedDict, total=False):
     status:               Annotated[str, _last_value]
     current_node:         Annotated[str, _last_value]
     errors:               Annotated[list, operator.add]
+    
+    # ── Visual Consistency & State ────────────────────────
+    global_seed:          Annotated[int, _last_value]
+    last_scene_frame_b64: Annotated[str, _last_value]
 
     # ── Fault tolerance ───────────────────────────────────
     resume_from_memory:   bool

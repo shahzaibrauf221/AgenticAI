@@ -171,6 +171,7 @@ def generate_script_segment(prompt: str, num_scenes: int = 3) -> str:
     """
     system = f"""You are a professional screenplay writer.
 Write exactly {num_scenes} scenes for the story idea given by the user.
+Keep the film compact: tight pacing, no filler monologues. Aim for satisfying scene beats with enough dialogue to anchor each clip (avoid ultra-sparse exchanges).
 Return ONLY a valid JSON object with NO markdown, NO code fences, NO explanation.
 Use exactly this structure:
 {{
@@ -182,7 +183,7 @@ Use exactly this structure:
       "location": "specific place name",
       "time_of_day": "day or night or dawn etc",
       "characters": ["Character Name 1", "Character Name 2"],
-      "action_description": "detailed description of what happens in this scene",
+      "action_description": "1-2 SHORT sentences: only the key physical beat and outcome for this scene",
       "dialogue": [
         {{
           "speaker": "Character Name",
@@ -194,7 +195,16 @@ Use exactly this structure:
     }}
   ]
 }}
-Fill in ALL fields with real content. Do not use placeholder words like 'string' or 'name'."""
+Fill in ALL fields with real content. Do not use placeholder words like 'string' or 'name'.
+IMPORTANT RULES for scene_visual_cue:
+1. NATURAL LANGUAGE STYLE (MANDATORY): Write `scene_visual_cue` as 1-2 flowing cinematic sentences, not comma-separated tags or keyword lists.
+2. GENDER & BUILD (MANDATORY): Every character mention MUST include explicit gender, approximate age, and body type/build.
+3. SETTING CONTINUITY (MANDATORY): EVERY `scene_visual_cue` MUST explicitly restate the environment/background, even when unchanged.
+4. CINEMATIC CAMERA DETAIL (MANDATORY): Include framing or movement details (example: wide shot, tracking shot, slow push-in, over-shoulder).
+5. DIALOGUE LENGTH (MANDATORY): Every scene MUST include **2–3 dialogue entries**. Single-line scenes are forbidden. Each "line" is ONE natural conversational sentence capped at ~22 words (no monologues; keep punchy exchanges).
+6. STORY PROGRESSION (MANDATORY): Adjacent scenes must show clear progression (new beat, action change, or reveal), not rephrased duplicates.
+7. OUTPUT SAFETY: Keep `scene_visual_cue` physically descriptive only. No metaphors, internal thoughts, or abstract themes.
+8. QUALITY CHECK BEFORE RETURN: If any scene violates rules 1-7, rewrite it before returning JSON."""
 
     return _llm(system, prompt)
 

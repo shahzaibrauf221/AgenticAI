@@ -52,8 +52,9 @@ def build_timing_manifest(phase2_dir: Path, phase1_dir: Path, out_dir: Path):
 
     segments = []
     cursor_ms = 0
+    scenes = script.get("scenes", []) or []
 
-    for scene in script.get("scenes", []):
+    for scene in scenes:
         sid = scene.get("scene_id")
         for line_idx, d in enumerate(scene.get("dialogue", [])):
             speaker = d.get("speaker", "")

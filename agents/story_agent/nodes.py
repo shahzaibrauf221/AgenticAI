@@ -219,7 +219,7 @@ async def scriptwriter_node(state: AgentState) -> dict:
     print("[Scriptwriter] Generating script from prompt…")
 
     prompt     = state.get("user_input", "")
-    num_scenes = 4
+    num_scenes = 3
 
     raw = await _call_tool("generate_script_segment", prompt=prompt, num_scenes=num_scenes)
     print(f"[Scriptwriter] Raw tool output (first 300 chars): {raw[:300]}")

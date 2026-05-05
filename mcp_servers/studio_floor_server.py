@@ -13,11 +13,24 @@
 # All existing tools are unchanged. Existing pipeline still works.
 # ============================================================
 
+import base64
 import hashlib
 import json
 import math
 import os
+import sys
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+if sys.stdout.encoding.lower() != 'utf-8':
+    sys.stdout.reconfigure(encoding='utf-8')
+if sys.stderr.encoding.lower() != 'utf-8':
+    sys.stderr.reconfigure(encoding='utf-8')
 import random
+import requests
 import shutil
 import struct
 import subprocess
@@ -25,10 +38,13 @@ import time
 import uuid
 import wave
 from datetime import datetime
-from pathlib import Path
 
 import chromadb
 from mcp.server.fastmcp import FastMCP
+from shared.utils.bytedance_video_client import (
+    ByteDanceVideoClient,
+    ByteDanceVideoClientError,
+)
 
 # ─── Load .env ────────────────────────────────────────────────────────────────
 def _load_env():
@@ -489,31 +505,26 @@ def mix_audio_with_bgm(
     })
 
 
-# ─── 3. Video Gen Tool (unchanged from your working version) ─────────────────
+# ─── 3. Video Gen Tool ─────────────────────────────────────────────────────────
 
-def _render_scene_video_pil(out_path: Path, scene_id: int, location: str,
-                             characters: list, visual_cue: str, duration_s: float,
-                             character_images: dict = None, fps: int = 12) -> bool:
+def _render_scene_video_pil_clean(
+    out_path: Path,
+    scene_id: int,
+    prompt: str,
+    duration_s: float,
+    fps: int = 12,
+) -> bool:
+    """Local fallback renderer — clean background + text only, no character cards."""
     try:
         from PIL import Image, ImageDraw, ImageFont
     except ImportError:
         return False
 
-    character_images = character_images or {}
     W, H = 640, 360
     n_frames = max(1, int(duration_s * fps))
     scene_frames_dir = FRAMES_DIR / f"scene_{scene_id:02d}"
     scene_frames_dir.mkdir(parents=True, exist_ok=True)
-    bg_color = _deterministic_color(location or f"scene_{scene_id}")
-
-    char_portraits = {}
-    for char in characters[:4]:
-        img_path = character_images.get(char)
-        if img_path and Path(img_path).exists():
-            try:
-                char_portraits[char] = Image.open(img_path).convert("RGBA").resize((100, 100))
-            except Exception as e:
-                print(f"  [video] couldn't load portrait for {char}: {e}")
+    bg_color = _deterministic_color(prompt[:20] if prompt else f"scene_{scene_id}")
 
     try:
         font = ImageFont.load_default()
@@ -524,28 +535,15 @@ def _render_scene_video_pil(out_path: Path, scene_id: int, location: str,
         img = Image.new("RGBA", (W, H), bg_color + (255,))
         draw = ImageDraw.Draw(img)
         pulse = int(30 * math.sin(2 * math.pi * i / max(1, n_frames)))
-        overlay_color = (max(0, min(255, bg_color[0] + pulse)),
-                         max(0, min(255, bg_color[1] + pulse)),
-                         max(0, min(255, bg_color[2] + pulse)))
+        overlay_color = (
+            max(0, min(255, bg_color[0] + pulse)),
+            max(0, min(255, bg_color[1] + pulse)),
+            max(0, min(255, bg_color[2] + pulse)),
+        )
         draw.rectangle([(0, H - 80), (W, H)], fill=overlay_color + (255,))
         draw.text((20, 20), f"SCENE {scene_id}", fill=(255, 255, 255), font=font)
-        draw.text((20, 50), f"LOCATION: {location[:50]}", fill=(230, 230, 230), font=font)
-
-        for idx, char in enumerate(characters[:4]):
-            cx = 90 + idx * 140
-            cy = H // 2 + int(6 * math.sin(2 * math.pi * i / max(1, fps)))
-            if char in char_portraits:
-                img.alpha_composite(char_portraits[char], (cx - 50, cy - 50))
-                draw.rectangle([(cx - 50, cy - 50), (cx + 50, cy + 50)],
-                               outline=(255, 255, 255, 255), width=2)
-            else:
-                ccolor = _deterministic_color(char) + (255,)
-                draw.ellipse([(cx - 45, cy - 45), (cx + 45, cy + 45)],
-                             fill=ccolor, outline=(0, 0, 0, 255))
-            draw.text((cx - 40, cy + 55), char[:14], fill=(255, 255, 255), font=font)
-
-        cue = (visual_cue or "")[:70]
-        draw.text((20, H - 70), cue, fill=(255, 255, 200), font=font)
+        draw.text((20, 50), f"PROMPT: {prompt[:50]}", fill=(230, 230, 230), font=font)
+        # No character portraits, no ellipses, no character name labels
         draw.text((20, H - 30), f"frame {i+1}/{n_frames}", fill=(200, 200, 200), font=font)
         img.convert("RGB").save(scene_frames_dir / f"frame_{i:04d}.png")
 
@@ -567,43 +565,153 @@ def _render_scene_video_pil(out_path: Path, scene_id: int, location: str,
 
 
 @mcp.tool()
-def query_stock_footage(scene_id: int, location: str, characters: list,
-                         visual_cue: str = "", duration_s: float = 5.0) -> str:
-    """PDF §5.3 Video Gen tool."""
-    safe_loc = _safe_name(location[:40]) if location else f"scene_{scene_id}"
+def query_stock_footage(
+    scene_id: int,
+    prompt: str,
+    num_frames: int = 16,
+    width: int = 512,
+    height: int = 512,
+    seed: int = -1,
+    negative_prompt: str = "",
+    denoising_strength: float = 0.0,
+    init_image_b64: str = "",
+) -> str:
+    """PDF §5.3 Video Gen tool — generates base video via ByteDance API.
+
+    Args:
+        scene_id:    Scene number.
+        prompt:      Detailed visual prompt for image/video generation.
+        num_frames:  Number of frames to generate (e.g. 16).
+        width:       Video width.
+        height:      Video height.
+
+    Falls back to a clean local PIL placeholder if ByteDance API is not set
+    or remote generation fails.
+    """
+    safe_loc = _safe_name(prompt[:40]) if prompt else f"scene_{scene_id}"
     out_path = VIDEO_DIR / f"scene_{scene_id:02d}_{safe_loc}.mp4"
 
-    if isinstance(characters, str):
+    # ── Attempt ByteDance Seedance async API ───────────────────────────────────
+    if os.environ.get("BYTEDANCE_API_BASE_URL") and os.environ.get("BYTEDANCE_API_KEY"):
         try:
-            characters = json.loads(characters)
-        except json.JSONDecodeError:
-            characters = [characters]
+            client = ByteDanceVideoClient.from_env()
+            print(f"  [video | scene {scene_id}] Submitting async ByteDance task...")
+            # Do not pass num_frames-derived duration (often 2s); seedance-1-5 rejects it.
+            # Uses BYTEDANCE_VIDEO_DURATION + BYTEDANCE_ALLOWED_DURATIONS in the client.
+            shot_kw: dict = {}
+            if raw := os.environ.get("BYTEDANCE_SHOT_SECONDS"):
+                try:
+                    shot_kw["duration_s"] = max(1.0, float(raw.strip()))
+                except ValueError:
+                    pass
+            local_file = client.generate_video_and_wait(
+                prompt=prompt,
+                output_path=out_path,
+                scene_id=scene_id,
+                width=width,
+                height=height,
+                seed=seed,
+                **shot_kw,
+            )
+            local_path = Path(local_file)
+            if local_path.exists():
+                print(f"  [video | scene {scene_id}] ✓ ByteDance video saved to {local_path} "
+                      f"({local_path.stat().st_size // 1024} KB)")
+                return json.dumps({
+                    "status":     "success",
+                    "scene_id":   scene_id,
+                    "file":       str(local_path),
+                    "num_frames": num_frames,
+                    "provider":   "bytedance_seedance",
+                })
+        except ByteDanceVideoClientError as e:
+            print(f"  [video | scene {scene_id}] ✗ ByteDance generation FAILED: {e}")
+            print(f"  [video | scene {scene_id}]   → using local PIL fallback")
+        except Exception as e:
+            print(f"  [video | scene {scene_id}] ✗ Unexpected ByteDance error: {type(e).__name__}: {e}")
+            print(f"  [video | scene {scene_id}]   → using local PIL fallback")
 
-    character_images = {}
-    for char in characters or []:
-        png_path = _find_character_png(char)
-        if png_path:
-            character_images[char] = png_path
-            print(f"  [video | scene {scene_id}] using Phase 1 portrait for '{char}'")
-        else:
-            print(f"  [video | scene {scene_id}] no Phase 1 portrait for '{char}'")
-
-    success = _render_scene_video_pil(
-        out_path=out_path, scene_id=scene_id, location=location,
-        characters=characters or [], visual_cue=visual_cue,
-        duration_s=duration_s, character_images=character_images,
+    # ── Local fallback (no character cards) ─────────────────────────────────
+    fps = 8 # Match AnimateDiff target FPS for consistency
+    derived_duration = num_frames / fps
+    
+    print(f"  [video | scene {scene_id}] Rendering local fallback ({derived_duration:.1f}s)")
+    success = _render_scene_video_pil_clean(
+        out_path=out_path,
+        scene_id=scene_id,
+        prompt=prompt,
+        duration_s=derived_duration,
     )
 
-    fps = 12
     result_file = str(out_path) if out_path.exists() else str(FRAMES_DIR / f"scene_{scene_id:02d}")
     return json.dumps({
-        "status": "success" if success else "frames_only",
-        "scene_id": scene_id, "location": location, "file": result_file,
-        "fps": fps, "duration_s": duration_s,
-        "frame_count": int(duration_s * fps),
-        "character_portraits_used": list(character_images.keys()),
+        "status":     "success" if success else "frames_only",
+        "scene_id":   scene_id,
+        "file":       result_file,
+        "fps":        fps,
+        "duration_s": derived_duration,
+        "frame_count": num_frames,
+        "provider":   "local_pil_clean",
         "ffmpeg_available": _has_ffmpeg(),
     })
+
+
+
+# ─── 3b. Stock Image Tool (background fallback for lip_sync_node) ─────────────
+
+@mcp.tool()
+def query_stock_image(
+    scene_id: int,
+    visual_cue: str = "",
+    location: str = "",
+    mood: str = "",
+) -> str:
+    """Generate a background still image for a scene.
+
+    Used by lip_sync_node as a fallback when no face-swapped video exists.
+    Creates a clean PIL placeholder PNG (background colour + text, no character
+    cards) and returns its path.
+
+    Args:
+        scene_id:   Scene number.
+        visual_cue: Short visual description / prompt.
+        location:   Scene location (used for colour seed).
+        mood:       Scene mood (displayed as text).
+
+    Returns: {status, scene_id, file}
+    """
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        return json.dumps({"status": "error", "error": "PIL not installed"})
+
+    out_path = FRAMES_DIR / f"scene_{scene_id:02d}_bg_image.png"
+    W, H = 1920, 1080
+
+    seed = location or visual_cue or f"scene_{scene_id}"
+    bg_color = _deterministic_color(seed[:20])
+
+    img  = Image.new("RGB", (W, H), bg_color)
+    draw = ImageDraw.Draw(img)
+
+    # Subtle gradient-feel: darker bottom bar
+    darker = tuple(max(0, c - 60) for c in bg_color)
+    draw.rectangle([(0, H - 200), (W, H)], fill=darker)
+
+    try:
+        font = ImageFont.load_default()
+    except Exception:
+        font = None
+
+    draw.text((60, 60),      f"SCENE {scene_id}",          fill=(255, 255, 255), font=font)
+    draw.text((60, 100),     (visual_cue or "")[:120],      fill=(220, 220, 220), font=font)
+    draw.text((60, H - 160), f"Location: {location[:80]}", fill=(200, 200, 200), font=font)
+    if mood:
+        draw.text((60, H - 120), f"Mood: {mood[:60]}", fill=(180, 180, 180), font=font)
+
+    img.save(str(out_path))
+    print(f"  [BG Image     | scene {scene_id}] ✓ {out_path}")
+    return json.dumps({"status": "success", "scene_id": scene_id, "file": str(out_path)})
 
 
 # ─── 4. Face Swap Tools ───────────────────────────────────────────────────────
@@ -643,75 +751,81 @@ def identity_validator(character_name: str, character_db_json: str) -> str:
 @mcp.tool()
 def face_swapper(scene_id: int, base_video_path: str,
                   character_name: str, reference_path: str = "") -> str:
-    """PDF §5.4 face_swapper."""
-    try:
-        from PIL import Image, ImageDraw
-    except ImportError:
-        return json.dumps({"status": "error", "error": "PIL not installed"})
+    """PDF §5.4 face_swapper.
 
-    scene_frames_dir = FRAMES_DIR / f"scene_{scene_id:02d}"
-    swapped_dir      = FRAMES_DIR / f"scene_{scene_id:02d}_swapped"
-    swapped_dir.mkdir(parents=True, exist_ok=True)
+    If GPU_WORKER_URL is set: streams the base video + reference portrait PNG to
+    the Kaggle /face_swap endpoint and saves the returned MP4.
+    Local fallback: copies the base video unmodified.
+    """
+    out_path = VIDEO_DIR / f"scene_{scene_id:02d}_faceswapped.mp4"
 
-    if not scene_frames_dir.exists():
+    if not Path(base_video_path).exists():
         return json.dumps({"status": "error", "scene_id": scene_id,
-                           "error": f"No source frames at {scene_frames_dir}"})
+                           "error": f"base_video_path not found: {base_video_path}"})
 
-    frame_files = sorted(scene_frames_dir.glob("frame_*.png"))
-    if not frame_files:
-        return json.dumps({"status": "error", "error": "No frames to swap."})
+    _NGROK_HEADERS = {
+        "ngrok-skip-browser-warning": "1",
+        "User-Agent": "MontageLocalServer/1.0",
+    }
 
+    gpu_url = os.environ.get("GPU_WORKER_URL", "").rstrip("/")
+
+    # Resolve reference portrait
     if not reference_path or not Path(reference_path).exists():
         reference_path = _find_character_png(character_name)
+    used_real_portrait = bool(reference_path and Path(reference_path).exists())
 
-    ref_img = None
-    used_real_portrait = False
-    if reference_path and Path(reference_path).exists():
+    # ── Attempt remote GPU face-swap ──────────────────────────────────────────
+    if gpu_url and used_real_portrait:
         try:
-            ref_img = Image.open(reference_path).convert("RGBA").resize((200, 200))
-            used_real_portrait = True
-            print(f"  [face_swap | scene {scene_id}] using real portrait")
+            print(f"  [face_swap | scene {scene_id}] Sending to remote GPU for real face-swap")
+            with open(base_video_path, "rb") as vf, open(reference_path, "rb") as pf:
+                resp = requests.post(
+                    f"{gpu_url}/face_swap",
+                    files={
+                        "source_image": (Path(reference_path).name, pf, "image/png"),
+                        "target_video":  (Path(base_video_path).name, vf, "video/mp4"),
+                    },
+                    data={"scene_id": str(scene_id), "character_id": character_name[:20]},
+                    headers=_NGROK_HEADERS,
+                    timeout=300,
+                )
+            resp.raise_for_status()
+            ct = resp.headers.get("content-type", "")
+            if "json" not in ct:
+                raise ValueError(f"Expected JSON, got '{ct}'. Prefix: {resp.text[:200]!r}")
+            result = resp.json()
+            video_b64 = result.get("video_b64", "")
+            if video_b64:
+                out_path.write_bytes(base64.b64decode(video_b64))
+                print(f"  [face_swap | scene {scene_id}] ✓ Remote face-swap saved ({out_path.stat().st_size // 1024} KB)")
+                return json.dumps({
+                    "status": "success", "scene_id": scene_id,
+                    "character": character_name, "file": str(out_path),
+                    "frames_processed": -1,  # not tracked by remote worker
+                    "reference_used": reference_path,
+                    "used_real_portrait": True,
+                    "provider": "remote_insightface",
+                })
+            else:
+                print(f"  [face_swap | scene {scene_id}] ✗ Remote returned no video_b64: {list(result.keys())}")
         except Exception as e:
-            print(f"  [face_swap | scene {scene_id}] couldn't load: {e}")
+            print(f"  [face_swap | scene {scene_id}] ✗ Remote face-swap failed: {type(e).__name__}: {e}")
+            print(f"  [face_swap | scene {scene_id}]   → using local pass-through fallback")
+    elif gpu_url and not used_real_portrait:
+        print(f"  [face_swap | scene {scene_id}] ⚠ No portrait for '{character_name}' — skipping remote face-swap")
 
-    if ref_img is None:
-        ref_img = Image.new("RGBA", (200, 200), (0, 0, 0, 0))
-        d = ImageDraw.Draw(ref_img)
-        color = _deterministic_color(character_name) + (255,)
-        d.ellipse([(0, 0), (200, 200)], fill=color,
-                  outline=(255, 255, 255, 255), width=4)
+    # ── Local fallback: pass base video through unmodified ────────────────────
+    shutil.copy2(base_video_path, out_path)
+    print(f"  [face_swap | scene {scene_id}] ℹ Local pass-through (no GPU swap performed)")
 
-    for f in frame_files:
-        frame = Image.open(f).convert("RGBA")
-        frame.alpha_composite(ref_img, (frame.width - 210, 10))
-        d = ImageDraw.Draw(frame, "RGBA")
-        d.rectangle([(frame.width - 210, 215), (frame.width - 10, 240)],
-                    fill=(0, 0, 0, 180))
-        d.text((frame.width - 205, 220), f"FOCUS: {character_name[:20]}",
-               fill=(255, 215, 0, 255))
-        frame.convert("RGB").save(swapped_dir / f.name)
-
-    out_path = VIDEO_DIR / f"scene_{scene_id:02d}_faceswapped.mp4"
-    fps = 12
-    if _has_ffmpeg():
-        try:
-            subprocess.run(
-                ["ffmpeg", "-y", "-loglevel", "error",
-                 "-framerate", str(fps),
-                 "-i", str(swapped_dir / "frame_%04d.png"),
-                 "-c:v", "libx264", "-pix_fmt", "yuv420p", str(out_path)],
-                check=True,
-            )
-        except subprocess.CalledProcessError as e:
-            return json.dumps({"status": "error", "error": f"re-encode: {e}"})
-
-    result_file = str(out_path) if out_path.exists() else str(swapped_dir)
     return json.dumps({
         "status": "success", "scene_id": scene_id,
-        "character": character_name, "file": result_file,
-        "frames_processed": len(frame_files),
-        "reference_used": reference_path or "synthetic_placeholder",
+        "character": character_name, "file": str(out_path),
+        "frames_processed": 0,
+        "reference_used": reference_path or "none",
         "used_real_portrait": used_real_portrait,
+        "provider": "local_passthrough",
     })
 
 
@@ -750,17 +864,25 @@ def _concat_audio_files(audio_files: list, out_path: Path) -> float:
 
 @mcp.tool()
 def lip_sync_aligner(scene_id: int, video_path: str, audio_files: list) -> str:
-    """PDF §5.5 lip_sync_aligner. Hard-locks video duration to audio."""
+    """PDF §5.5 lip_sync_aligner.
+
+    If GPU_WORKER_URL is set: streams video + concatenated audio to the Kaggle
+    /lip_sync (Wav2Lip) endpoint and saves the returned MP4.
+    Local fallback: hard-muxes the audio onto the video via ffmpeg (no mouth sync).
+    """
+    _NGROK_HEADERS = {
+        "ngrok-skip-browser-warning": "1",
+        "User-Agent": "MontageLocalServer/1.0",
+    }
+
     if isinstance(audio_files, str):
         try:
             audio_files = json.loads(audio_files)
         except json.JSONDecodeError:
             audio_files = [audio_files]
 
+    # ── Build / locate the concat audio ──────────────────────────────────────
     concat_audio = AUDIO_DIR / f"scene_{scene_id:02d}_full.wav"
-
-    # If a pre-mixed (dialogue+BGM) version already exists, use it.
-    # Otherwise concat dialogue.
     if not concat_audio.exists():
         audio_duration = _concat_audio_files(audio_files or [], concat_audio)
     else:
@@ -775,13 +897,66 @@ def lip_sync_aligner(scene_id: int, video_path: str, audio_files: list) -> str:
             audio_duration = 5.0
 
     out_path = SCENES_DIR / f"scene_{scene_id:02d}.mp4"
-    if not _has_ffmpeg():
-        return json.dumps({"status": "error", "scene_id": scene_id,
-                           "error": "ffmpeg required"})
+
     if not Path(video_path).exists():
         return json.dumps({"status": "error", "scene_id": scene_id,
                            "error": f"video not found: {video_path}"})
 
+    # ── Attempt remote GPU Wav2Lip ────────────────────────────────────────────
+    gpu_url = os.environ.get("GPU_WORKER_URL", "").rstrip("/")
+    if gpu_url and concat_audio.exists():
+        try:
+            print(f"  [lip_sync | scene {scene_id}] Sending to remote Wav2Lip")
+            with open(video_path, "rb") as vf, open(str(concat_audio), "rb") as af:
+                resp = requests.post(
+                    f"{gpu_url}/lip_sync",
+                    files={
+                        "video": (Path(video_path).name, vf, "video/mp4"),
+                        "audio": (concat_audio.name,     af, "audio/wav"),
+                    },
+                    data={"scene_id": str(scene_id)},
+                    headers=_NGROK_HEADERS,
+                    timeout=300,
+                )
+            resp.raise_for_status()
+            ct = resp.headers.get("content-type", "")
+            if "json" not in ct:
+                raise ValueError(f"Expected JSON, got '{ct}'. Prefix: {resp.text[:200]!r}")
+            result = resp.json()
+            video_b64 = result.get("video_b64", "")
+            if video_b64:
+                out_path.write_bytes(base64.b64decode(video_b64))
+                # Measure real duration
+                probe2 = subprocess.run(
+                    ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                     "-of", "default=noprint_wrappers=1:nokey=1", str(out_path)],
+                    capture_output=True, text=True,
+                )
+                try:
+                    final_duration = float(probe2.stdout.strip())
+                except ValueError:
+                    final_duration = audio_duration
+                drift = abs(final_duration - audio_duration)
+                score = max(0.0, 1.0 - (drift / max(1.0, audio_duration)))
+                print(f"  [lip_sync | scene {scene_id}] ✓ Remote Wav2Lip done ({out_path.stat().st_size // 1024} KB)")
+                return json.dumps({
+                    "status": "success", "scene_id": scene_id,
+                    "file": str(out_path), "duration_s": round(final_duration, 2),
+                    "audio_duration": round(audio_duration, 2),
+                    "lip_sync_score": round(score, 3),
+                    "drift_s": round(drift, 3),
+                    "provider": "remote_wav2lip",
+                })
+            else:
+                print(f"  [lip_sync | scene {scene_id}] ✗ Remote returned no video_b64: {list(result.keys())}")
+        except Exception as e:
+            print(f"  [lip_sync | scene {scene_id}] ✗ Remote Wav2Lip failed: {type(e).__name__}: {e}")
+            print(f"  [lip_sync | scene {scene_id}]   → falling back to local ffmpeg mux")
+
+    # ── Local fallback: ffmpeg hard-mux (no mouth sync) ───────────────────────
+    if not _has_ffmpeg():
+        return json.dumps({"status": "error", "scene_id": scene_id,
+                           "error": "ffmpeg required for local fallback"})
     try:
         subprocess.run(
             ["ffmpeg", "-y", "-loglevel", "error",
@@ -808,13 +983,13 @@ def lip_sync_aligner(scene_id: int, video_path: str, audio_files: list) -> str:
 
     drift = abs(final_duration - audio_duration)
     score = max(0.0, 1.0 - (drift / max(1.0, audio_duration)))
-
     return json.dumps({
         "status": "success", "scene_id": scene_id,
         "file": str(out_path), "duration_s": round(final_duration, 2),
         "audio_duration": round(audio_duration, 2),
         "lip_sync_score": round(score, 3),
         "drift_s": round(drift, 3),
+        "provider": "local_ffmpeg_mux",
     })
 
 
