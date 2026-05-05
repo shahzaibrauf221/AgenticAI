@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>AgenticAI Studio — Writer's Room</title>
+<style>
+  :root {
+    --bg:        #0e0f17;
+    --bg-card:   #181a26;
+    --bg-elev:   #232636;
+    --fg:        #e7e8ee;
+    --fg-dim:    #9498a6;
+    --accent:    #7c5cff;
+    --accent-2:  #4ad8c1;
+    --warn:      #ffb547;
+    --err:       #ff6c8e;
+    --ok:        #4ad8c1;
+    --border:    #2b2e42;
+    --mono:      ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg); color: var(--fg);
+    min-height: 100vh;
+  }
+  header {
+    padding: 24px 36px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 16px;
+    background: linear-gradient(180deg, #1b1d2c 0%, var(--bg) 100%);
+  }
+  header h1 {
+    margin: 0; font-size: 22px; font-weight: 600;
+    background: linear-gradient(90deg, var(--accent), var(--accent-2));
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  header .badge {
+    font-size: 11px; padding: 3px 8px; border-radius: 8px;
+    background: var(--bg-elev); color: var(--fg-dim);
+    border: 1px solid var(--border);
+  }
+  main {
+    display: grid; grid-template-columns: 380px 1fr; gap: 24px;
+    padding: 24px 36px;
+  }
+  @media (max-width: 980px) {
+    main { grid-template-columns: 1fr; }
+  }
+  .card {
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: 14px; padding: 20px;
+    margin-bottom: 20px;
+  }
+  .card h2 {
+    margin: 0 0 14px 0; font-size: 14px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.06em; color: var(--fg-dim);
+  }
+  textarea, input {
+    width: 100%; padding: 10px 12px;
+    background: var(--bg-elev); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 8px;
+    font-size: 14px; font-family: inherit; outline: none;
+    resize: vertical;
+  }
+  textarea:focus, input:focus { border-color: var(--accent); }
+  button {
+    cursor: pointer; padding: 10px 14px; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--bg-elev);
+    color: var(--fg); font-size: 14px; font-weight: 500;
+    transition: all 0.15s; font-family: inherit;
+  }
+  button:hover:not(:disabled) {
+    background: var(--accent); border-color: var(--accent); color: #fff;
+  }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  button.primary {
+    background: var(--accent); border-color: var(--accent); color: #fff;
+  }
+  button.primary:hover:not(:disabled) { filter: brightness(1.1); }
+  button.ghost { background: transparent; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .row > * { flex: 1; }
+
+  /* Phase tracker */
+  .phases { display: flex; gap: 8px; }
+  .phase-pill {
+    flex: 1; padding: 10px 8px; border-radius: 8px;
+    background: var(--bg-elev); border: 1px solid var(--border);
+    text-align: center; font-size: 12px; color: var(--fg-dim);
+    transition: all 0.2s;
+  }
+  .phase-pill.active {
+    border-color: var(--accent); color: var(--fg);
+    background: linear-gradient(180deg, rgba(124,92,255,0.18) 0%, transparent 100%);
+  }
+  .phase-pill.done {
+    border-color: var(--ok); color: var(--ok);
+  }
+  .phase-pill.failed {
+    border-color: var(--err); color: var(--err);
+  }
+  .phase-pill .label { font-weight: 600; display: block; }
+  .phase-pill .sub   { font-size: 10px; margin-top: 2px; opacity: 0.7; }
+
+  /* Logs */
+  .logs {
+    background: #0a0b14; border: 1px solid var(--border);
+    border-radius: 8px; padding: 12px;
+    height: 360px; overflow-y: auto;
+    font-family: var(--mono); font-size: 12px; line-height: 1.5;
+  }
+  .logs .line { white-space: pre-wrap; word-break: break-word; }
+  .logs .log    { color: #c4c8d8; }
+  .logs .phase  { color: var(--accent); font-weight: 600; }
+  .logs .done   { color: var(--ok);   font-weight: 600; }
+  .logs .error  { color: var(--err);  font-weight: 600; }
+  .logs .ts     { color: var(--fg-dim); margin-right: 6px; }
+
+  /* Status indicator */
+  .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .status-running  { background: var(--warn); animation: pulse 1.5s infinite; }
+  .status-complete { background: var(--ok); }
+  .status-failed   { background: var(--err); }
+  .status-queued   { background: var(--fg-dim); }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50%      { opacity: 0.5; transform: scale(0.85); }
+  }
+
+  /* Outputs panel */
+  .scenes-list {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 10px;
+  }
+  .scene-card {
+    background: var(--bg-elev); padding: 10px; border-radius: 8px;
+    border: 1px solid var(--border); font-size: 12px;
+  }
+  .scene-card h4 { margin: 0 0 4px 0; font-size: 13px; }
+  .scene-card p  { margin: 0; color: var(--fg-dim); line-height: 1.4; }
+
+  .video-player {
+    background: #000; border-radius: 10px; overflow: hidden;
+    border: 1px solid var(--border); aspect-ratio: 16/9;
+  }
+  .video-player video { width: 100%; height: 100%; display: block; }
+  .empty {
+    text-align: center; padding: 40px 20px; color: var(--fg-dim);
+    font-size: 14px; border: 2px dashed var(--border); border-radius: 10px;
+  }
+
+  .characters-grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+    gap: 12px;
+  }
+  .character-card {
+    background: var(--bg-elev); border-radius: 10px; padding: 10px;
+    border: 1px solid var(--border); text-align: center;
+  }
+  .character-card img {
+    width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 8px;
+    background: #0a0b14;
+  }
+  .character-card .name { font-size: 12px; font-weight: 600; margin-top: 8px; }
+  .character-card .traits { font-size: 10px; color: var(--fg-dim); margin-top: 2px; }
+
+  .small  { font-size: 11px; color: var(--fg-dim); }
+  .pill   { display: inline-block; padding: 2px 8px; border-radius: 10px;
+            background: var(--bg-elev); border: 1px solid var(--border); font-size: 11px; }
+  hr { border: none; border-top: 1px solid var(--border); margin: 14px 0; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>🎬 AgenticAI Studio</h1>
+  <span class="badge">Writer's Room → Audio → Video</span>
+  <div style="margin-left:auto;">
+    <span id="connStatus" class="small">
+      <span class="status-dot status-queued"></span>idle
+    </span>
+  </div>
+</header>
+
+<main>
+
+  <!-- ── LEFT COLUMN ────────────────────────────── -->
+  <div>
+
+    <div class="card">
+      <h2>Story Prompt</h2>
+      <textarea id="prompt" rows="4" placeholder="A young astronaut discovers a hidden ocean on Mars..."></textarea>
+      <div style="margin-top:10px;" class="row">
+        <button id="btnRunFull" class="primary">▶  Run full pipeline</button>
+      </div>
+      <div style="margin-top:8px;" class="row">
+        <button id="btnPhase1">Phase 1 only</button>
+        <button id="btnPhase2">Phase 2 only</button>
+        <button id="btnPhase3">Phase 3 only</button>
+      </div>
+      <p class="small" style="margin-top:8px;">
+        Phase 2/3 use the Phase 1 outputs already on disk.
+      </p>
+    </div>
+
+    <div class="card">
+      <h2>Pipeline Progress</h2>
+      <div class="phases">
+        <div class="phase-pill" id="pp1"><span class="label">Phase 1</span><span class="sub">Story</span></div>
+        <div class="phase-pill" id="pp2"><span class="label">Phase 2</span><span class="sub">Audio</span></div>
+        <div class="phase-pill" id="pp3"><span class="label">Phase 3</span><span class="sub">Video</span></div>
+      </div>
+      <hr/>
+      <div style="display:flex; justify-content:space-between; margin-bottom:8px;">
+        <span class="small">Live log</span>
+        <button class="ghost" id="btnClearLog" style="padding:4px 8px; font-size:11px;">Clear</button>
+      </div>
+      <div class="logs" id="logs"></div>
+    </div>
+
+  </div>
+
+  <!-- ── RIGHT COLUMN ───────────────────────────── -->
+  <div>
+
+    <div class="card">
+      <h2>Final Video</h2>
+      <div id="finalVideoArea" class="empty">No final video yet — run the pipeline.</div>
+      <div style="margin-top:10px;" class="row">
+        <button id="btnRefresh">⟳  Refresh outputs</button>
+        <button id="btnDownload" disabled>⬇ Download MP4</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Story</h2>
+      <div id="storyMeta" class="small">No script yet.</div>
+      <div id="scenesList" class="scenes-list" style="margin-top:12px;"></div>
+    </div>
+
+    <div class="card">
+      <h2>Characters</h2>
+      <div id="charactersGrid" class="characters-grid">
+        <div class="empty" style="grid-column: 1 / -1;">No characters yet.</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Per-Scene Clips</h2>
+      <div id="sceneClips"  class="scenes-list">
+        <div class="empty" style="grid-column: 1 / -1;">No scene clips yet.</div>
+      </div>
+    </div>
+
+  </div>
+
+</main>
+
+<script>
+// ─────────────────────────────────────────────────────────────
+//  AgenticAI Studio — frontend
+// ─────────────────────────────────────────────────────────────
+
+const API = "";   // Same-origin
+let currentJob = null;
+let evtSource  = null;
+
+const $ = (id) => document.getElementById(id);
+const logsEl     = $("logs");
+const promptEl   = $("prompt");
+const phasePills = { phase1: $("pp1"), phase2: $("pp2"), phase3: $("pp3") };
+
+// ─── Logging helpers ─────────────────────────────────────────
+
+function appendLog(type, msg) {
+  const ts = new Date().toLocaleTimeString();
+  const div = document.createElement("div");
+  div.className = "line " + (type || "log");
+  div.innerHTML = `<span class="ts">[${ts}]</span>${escapeHtml(msg)}`;
+  logsEl.appendChild(div);
+  logsEl.scrollTop = logsEl.scrollHeight;
+}
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  })[c]);
+}
+
+function setConn(status, label) {
+  const el = $("connStatus");
+  el.innerHTML = `<span class="status-dot status-${status}"></span>${label}`;
+}
+
+function setPhaseState(phase, state) {
+  // state: '', 'active', 'done', 'failed'
+  const el = phasePills[phase];
+  if (!el) return;
+  el.classList.remove("active", "done", "failed");
+  if (state) el.classList.add(state);
+}
+function resetPhases() {
+  ["phase1", "phase2", "phase3"].forEach(p => setPhaseState(p, ""));
+}
+
+// Detect phase from log text — handles output from orchestrator
+function inferPhaseFromMessage(msg) {
+  const m = msg.toUpperCase();
+  if (m.includes("PHASE 1") || m.includes("WRITER'S ROOM"))     return "phase1";
+  if (m.includes("PHASE 2") || m.includes("AUDIO AGENT"))       return "phase2";
+  if (m.includes("PHASE 3") || m.includes("VIDEO AGENT"))       return "phase3";
+  return null;
+}
+
+// ─── API calls ───────────────────────────────────────────────
+
+async function startJob(endpoint, body) {
+  resetPhases();
+  logsEl.innerHTML = "";
+  appendLog("phase", `→ POST ${endpoint}`);
+
+  const r = await fetch(API + endpoint, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const err = await r.text();
+    appendLog("error", `Failed to start: ${r.status} ${err}`);
+    return null;
+  }
+  const data = await r.json();
+  currentJob = data.job_id;
+  appendLog("phase", `Job started: ${currentJob}`);
+  setConn("running", `running (${currentJob})`);
+  attachSSE(currentJob);
+  return currentJob;
+}
+
+function attachSSE(jobId) {
+  if (evtSource) evtSource.close();
+  evtSource = new EventSource(API + `/api/jobs/${jobId}/events`);
+
+  evtSource.addEventListener("log", (e) => {
+    const d = JSON.parse(e.data);
+    const phase = inferPhaseFromMessage(d.message);
+    if (phase) setPhaseState(phase, "active");
+    appendLog("log", d.message);
+  });
+  evtSource.addEventListener("phase", (e) => {
+    const d = JSON.parse(e.data);
+    appendLog("phase", d.message);
+  });
+  evtSource.addEventListener("done", (e) => {
+    const d = JSON.parse(e.data);
+    appendLog("done", `✓ ${d.message} (${d.extra?.duration_s ?? "?"}s)`);
+    setConn("complete", "complete");
+    // Mark all touched phases done
+    ["phase1", "phase2", "phase3"].forEach(p => {
+      if (phasePills[p].classList.contains("active")) setPhaseState(p, "done");
+    });
+    refreshOutputs();
+    evtSource.close();
+  });
+  evtSource.addEventListener("error", (e) => {
+    if (e.data) {
+      const d = JSON.parse(e.data);
+      appendLog("error", `✗ ${d.message}`);
+    }
+    setConn("failed", "failed");
+    ["phase1", "phase2", "phase3"].forEach(p => {
+      if (phasePills[p].classList.contains("active")) setPhaseState(p, "failed");
+    });
+  });
+  evtSource.addEventListener("end", () => {
+    if (evtSource) evtSource.close();
+  });
+  evtSource.onerror = () => {
+    appendLog("error", "(SSE connection lost)");
+  };
+}
+
+// ─── Outputs panel ───────────────────────────────────────────
+
+async function refreshOutputs() {
+  try {
+    const r = await fetch(API + "/api/outputs/summary");
+    if (!r.ok) return;
+    const data = await r.json();
+    renderOutputs(data);
+  } catch (e) {
+    console.error("refreshOutputs failed", e);
+  }
+}
+
+function renderOutputs(data) {
+  // Final video
+  const finalArea = $("finalVideoArea");
+  const dlBtn     = $("btnDownload");
+  if (data.final_video) {
+    finalArea.innerHTML = `
+      <div class="video-player">
+        <video src="${data.final_video}" controls preload="metadata"></video>
+      </div>
+      <p class="small" style="margin-top:6px;">${data.final_video}</p>
+    `;
+    dlBtn.disabled = false;
+    dlBtn.onclick  = () => window.open(data.final_video, "_blank");
+  } else {
+    finalArea.className = "empty";
+    finalArea.textContent = "No final video yet — run the pipeline.";
+    dlBtn.disabled = true;
+  }
+
+  // Story metadata
+  const story = data.story || {};
+  $("storyMeta").innerHTML = story.title
+    ? `<strong style="color:var(--fg); font-size:14px;">${escapeHtml(story.title)}</strong>
+       <span class="pill">${escapeHtml(story.genre || "drama")}</span>
+       <p style="margin:6px 0 0 0;">${escapeHtml(story.logline || "")}</p>`
+    : "No script yet.";
+
+  // Scenes
+  const scenes = data.scenes || [];
+  $("scenesList").innerHTML = scenes.length
+    ? scenes.map(s => `
+        <div class="scene-card">
+          <h4>Scene ${s.scene_id}: ${escapeHtml(s.location || "")}</h4>
+          <p>${escapeHtml((s.action_description || "").slice(0, 120))}…</p>
+          <p style="margin-top:4px;">
+            <span class="pill">${escapeHtml(s.tone || "neutral")}</span>
+            <span class="pill">${(s.duration_s || 0).toFixed(1)}s</span>
+          </p>
+        </div>
+      `).join("")
+    : "";
+
+  // Characters
+  const chars = data.characters || [];
+  const imgMap = {};
+  (data.images || []).forEach(i => imgMap[i.name.toLowerCase()] = i.url);
+  $("charactersGrid").innerHTML = chars.length
+    ? chars.map(c => {
+        const safe = (c.name || "").toLowerCase().replace(/[^a-z0-9]/g, "_");
+        const url  = imgMap[`${safe}.png`] || "";
+        return `
+          <div class="character-card">
+            ${url ? `<img src="${url}" alt="${escapeHtml(c.name)}"/>` : `<div style="aspect-ratio:1; background:#0a0b14; border-radius:8px;"></div>`}
+            <div class="name">${escapeHtml(c.name)}</div>
+            <div class="traits">${escapeHtml((c.personality_traits || []).slice(0, 3).join(", "))}</div>
+          </div>
+        `;
+      }).join("")
+    : `<div class="empty" style="grid-column: 1 / -1;">No characters yet.</div>`;
+
+  // Final clips (per-scene)
+  const clips = data.final_clips || [];
+  $("sceneClips").innerHTML = clips.length
+    ? clips.map(c => `
+        <div class="scene-card">
+          <video src="${c.url}" controls style="width:100%; border-radius:6px; background:#000;"></video>
+          <p style="margin-top:6px;">${escapeHtml(c.name)} — ${c.size_mb} MB</p>
+        </div>
+      `).join("")
+    : `<div class="empty" style="grid-column: 1 / -1;">No scene clips yet.</div>`;
+}
+
+// ─── Wire up buttons ─────────────────────────────────────────
+
+$("btnRunFull").onclick = () => {
+  const p = promptEl.value.trim();
+  if (!p) { alert("Please enter a story prompt."); return; }
+  startJob("/api/run/full", {prompt: p});
+};
+$("btnPhase1").onclick = () => {
+  const p = promptEl.value.trim();
+  if (!p) { alert("Phase 1 needs a prompt."); return; }
+  startJob("/api/run/phase1", {prompt: p, phase1_dir: "data/outputs"});
+};
+$("btnPhase2").onclick = () => {
+  startJob("/api/run/phase2", {phase1_dir: "data/outputs"});
+};
+$("btnPhase3").onclick = () => {
+  startJob("/api/run/phase3", {phase1_dir: "data/outputs"});
+};
+$("btnClearLog").onclick = () => { logsEl.innerHTML = ""; };
+$("btnRefresh").onclick  = refreshOutputs;
+
+// Initial state
+refreshOutputs();
+appendLog("phase", "Ready. Enter a prompt and click Run.");
+</script>
+
+</body>
+</html>
