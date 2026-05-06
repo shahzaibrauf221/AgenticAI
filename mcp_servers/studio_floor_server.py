@@ -41,10 +41,6 @@ from datetime import datetime
 
 import chromadb
 from mcp.server.fastmcp import FastMCP
-from shared.utils.bytedance_video_client import (
-    ByteDanceVideoClient,
-    ByteDanceVideoClientError,
-)
 
 # ─── Load .env ────────────────────────────────────────────────────────────────
 def _load_env():
@@ -180,11 +176,9 @@ def get_task_graph(scene_manifest_json: str) -> str:
                 "video": {
                     "steps": [
                         {"tool": "query_stock_footage",  "status": "pending"},
-                        {"tool": "identity_validator",   "status": "pending"},
-                        {"tool": "face_swapper",         "status": "pending"},
                     ],
                 },
-                "fusion": {"tool": "lip_sync_aligner", "depends_on": ["audio", "video"]},
+                "fusion": {"tool": "mix_audio_with_bgm", "depends_on": ["audio", "video"]},
             },
         })
 
@@ -576,7 +570,7 @@ def query_stock_footage(
     denoising_strength: float = 0.0,
     init_image_b64: str = "",
 ) -> str:
-    """PDF §5.3 Video Gen tool — generates base video via ByteDance API.
+    """PDF §5.3 Video Gen tool — generates base video via remote Colab worker.
 
     Args:
         scene_id:    Scene number.
@@ -585,50 +579,54 @@ def query_stock_footage(
         width:       Video width.
         height:      Video height.
 
-    Falls back to a clean local PIL placeholder if ByteDance API is not set
+    Contract:
+      Endpoint: <COLAB_WORKER_URL>/generate_video
+      Form payload: prompt, scene_id, num_frames, width, height
+      Response: {"video_b64": "..."} (base64 MP4)
+
+    Falls back to a clean local PIL placeholder if Colab worker is not set
     or remote generation fails.
     """
-    safe_loc = _safe_name(prompt[:40]) if prompt else f"scene_{scene_id}"
-    out_path = VIDEO_DIR / f"scene_{scene_id:02d}_{safe_loc}.mp4"
+    # Raw animate output path requested by rollback plan
+    montage_out_dir = BASE_DIR / "montage_outputs"
+    montage_out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = montage_out_dir / f"scene{scene_id}_raw.mp4"
 
-    # ── Attempt ByteDance Seedance async API ───────────────────────────────────
-    if os.environ.get("BYTEDANCE_API_BASE_URL") and os.environ.get("BYTEDANCE_API_KEY"):
+    # ── Attempt remote Colab /generate_video ───────────────────────────────────
+    worker_url = os.environ.get("COLAB_WORKER_URL", "").rstrip("/")
+    if worker_url:
         try:
-            client = ByteDanceVideoClient.from_env()
-            print(f"  [video | scene {scene_id}] Submitting async ByteDance task...")
-            # Do not pass num_frames-derived duration (often 2s); seedance-1-5 rejects it.
-            # Uses BYTEDANCE_VIDEO_DURATION + BYTEDANCE_ALLOWED_DURATIONS in the client.
-            shot_kw: dict = {}
-            if raw := os.environ.get("BYTEDANCE_SHOT_SECONDS"):
-                try:
-                    shot_kw["duration_s"] = max(1.0, float(raw.strip()))
-                except ValueError:
-                    pass
-            local_file = client.generate_video_and_wait(
-                prompt=prompt,
-                output_path=out_path,
-                scene_id=scene_id,
-                width=width,
-                height=height,
-                seed=seed,
-                **shot_kw,
+            print(f"  [video | scene {scene_id}] Submitting Colab generate_video task...")
+            resp = requests.post(
+                f"{worker_url}/generate_video",
+                data={
+                    "prompt": prompt,
+                    "scene_id": str(scene_id),
+                    "num_frames": int(num_frames),
+                    "width": int(width),
+                    "height": int(height),
+                },
+                timeout=300,
             )
-            local_path = Path(local_file)
+            resp.raise_for_status()
+            payload = resp.json()
+            video_b64 = payload.get("video_b64", "")
+            if not video_b64:
+                raise ValueError(f"Response missing video_b64: keys={list(payload.keys())}")
+            out_path.write_bytes(base64.b64decode(video_b64))
+            local_path = Path(out_path)
             if local_path.exists():
-                print(f"  [video | scene {scene_id}] ✓ ByteDance video saved to {local_path} "
+                print(f"  [video | scene {scene_id}] ✓ Colab video saved to {local_path} "
                       f"({local_path.stat().st_size // 1024} KB)")
                 return json.dumps({
                     "status":     "success",
                     "scene_id":   scene_id,
                     "file":       str(local_path),
                     "num_frames": num_frames,
-                    "provider":   "bytedance_seedance",
+                    "provider":   "colab_animatediff",
                 })
-        except ByteDanceVideoClientError as e:
-            print(f"  [video | scene {scene_id}] ✗ ByteDance generation FAILED: {e}")
-            print(f"  [video | scene {scene_id}]   → using local PIL fallback")
         except Exception as e:
-            print(f"  [video | scene {scene_id}] ✗ Unexpected ByteDance error: {type(e).__name__}: {e}")
+            print(f"  [video | scene {scene_id}] ✗ Colab generation FAILED: {type(e).__name__}: {e}")
             print(f"  [video | scene {scene_id}]   → using local PIL fallback")
 
     # ── Local fallback (no character cards) ─────────────────────────────────
@@ -768,7 +766,10 @@ def face_swapper(scene_id: int, base_video_path: str,
         "User-Agent": "MontageLocalServer/1.0",
     }
 
-    gpu_url = os.environ.get("GPU_WORKER_URL", "").rstrip("/")
+    gpu_url = (
+        os.environ.get("COLAB_WORKER_URL", "").rstrip("/")
+        or os.environ.get("GPU_WORKER_URL", "").rstrip("/")
+    )
 
     # Resolve reference portrait
     if not reference_path or not Path(reference_path).exists():
@@ -903,7 +904,10 @@ def lip_sync_aligner(scene_id: int, video_path: str, audio_files: list) -> str:
                            "error": f"video not found: {video_path}"})
 
     # ── Attempt remote GPU Wav2Lip ────────────────────────────────────────────
-    gpu_url = os.environ.get("GPU_WORKER_URL", "").rstrip("/")
+    gpu_url = (
+        os.environ.get("COLAB_WORKER_URL", "").rstrip("/")
+        or os.environ.get("GPU_WORKER_URL", "").rstrip("/")
+    )
     if gpu_url and concat_audio.exists():
         try:
             print(f"  [lip_sync | scene {scene_id}] Sending to remote Wav2Lip")

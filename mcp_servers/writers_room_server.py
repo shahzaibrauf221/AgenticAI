@@ -18,7 +18,7 @@ from groq import Groq
 from mcp.server.fastmcp import FastMCP
 
 # ─── Load .env automatically ──────────────────────────────────────────────────
-def _load_env():
+def _load_env(force_override: bool = False):
     for candidate in [
         Path(__file__).parent.parent / ".env",   # project root (writers-room/.env)
         Path(__file__).parent / ".env",           # mcp_servers/.env
@@ -31,11 +31,17 @@ def _load_env():
                 key, _, value = line.partition("=")
                 key   = key.strip()
                 value = value.strip().strip('"').strip("'")
-                if key and value and key not in os.environ:
+                if not key or not value:
+                    continue
+                # For critical API keys, prefer the value in project .env over any
+                # stale shell/session environment to avoid confusing 401 failures.
+                if force_override or key.endswith("_API_KEY") or key in {"HF_TOKEN"}:
+                    os.environ[key] = value
+                elif key not in os.environ:
                     os.environ[key] = value
             break
 
-_load_env()
+_load_env(force_override=True)
 
 # ─── Init ─────────────────────────────────────────────────────────────────────
 mcp = FastMCP("writers_room", port=8100)
@@ -61,7 +67,13 @@ _memory_collection = _chroma_client.get_or_create_collection(
 )
 
 # ─── Groq Setup ───────────────────────────────────────────────────────────────
-_groq_client = Groq(api_key=os.environ["GROQ_API_KEY"])
+def _get_groq_client() -> Groq:
+    # Re-read .env before each call path to avoid stale inherited env values.
+    _load_env(force_override=True)
+    key = os.environ.get("GROQ_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError("GROQ_API_KEY is missing. Set it in project .env.")
+    return Groq(api_key=key)
 
 _MODELS = [
     "llama-3.3-70b-versatile",
@@ -93,7 +105,7 @@ def _llm(system: str, user: str) -> str:
     for model in _MODELS:
         for attempt in range(3):
             try:
-                response = _groq_client.chat.completions.create(
+                response = _get_groq_client().chat.completions.create(
                     model=model,
                     messages=[
                         {"role": "system", "content": "You are a helpful assistant. Always return only valid JSON with no markdown fences, no explanation, no extra text."},
@@ -196,12 +208,12 @@ Use exactly this structure:
   ]
 }}
 Fill in ALL fields with real content. Do not use placeholder words like 'string' or 'name'.
-IMPORTANT RULES for scene_visual_cue:
-1. NATURAL LANGUAGE STYLE (MANDATORY): Write `scene_visual_cue` as 1-2 flowing cinematic sentences, not comma-separated tags or keyword lists.
-2. GENDER & BUILD (MANDATORY): Every character mention MUST include explicit gender, approximate age, and body type/build.
-3. SETTING CONTINUITY (MANDATORY): EVERY `scene_visual_cue` MUST explicitly restate the environment/background, even when unchanged.
-4. CINEMATIC CAMERA DETAIL (MANDATORY): Include framing or movement details (example: wide shot, tracking shot, slow push-in, over-shoulder).
-5. DIALOGUE LENGTH (MANDATORY): Every scene MUST include **2–3 dialogue entries**. Single-line scenes are forbidden. Each "line" is ONE natural conversational sentence capped at ~22 words (no monologues; keep punchy exchanges).
+IMPORTANT RULES for scene_visual_cue (STRICT for SD1.5/AnimateDiff):
+1. COMPACT TAG FORMAT (MANDATORY): Write `scene_visual_cue` as comma-separated visual tags, not prose. Keep under 40 words total.
+2. GENDER/ANATOMY ENFORCEMENT (MANDATORY): For every on-screen character, explicitly include gender + age + build in tags (example: "30-year-old male, tall, broad shoulders").
+3. STRICT CONTINUITY (MANDATORY): Repeat core setting/background tags in EVERY scene (location, lighting, time/weather style), even if unchanged.
+4. CAMERA TAGS (MANDATORY): Include at least one camera/framing tag (example: "medium shot", "close-up", "tracking shot", "over-shoulder").
+5. DIALOGUE LENGTH (MANDATORY): Every scene MUST include 2–3 dialogue entries. Single-line scenes are forbidden. Each "line" is ONE natural conversational sentence capped at ~22 words (no monologues; keep punchy exchanges).
 6. STORY PROGRESSION (MANDATORY): Adjacent scenes must show clear progression (new beat, action change, or reveal), not rephrased duplicates.
 7. OUTPUT SAFETY: Keep `scene_visual_cue` physically descriptive only. No metaphors, internal thoughts, or abstract themes.
 8. QUALITY CHECK BEFORE RETURN: If any scene violates rules 1-7, rewrite it before returning JSON."""
