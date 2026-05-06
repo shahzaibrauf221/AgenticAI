@@ -99,6 +99,31 @@ def _estimate_scene_duration(scene: dict) -> float:
     return max(3.0, total_words / 2.5 + 2.0)
 
 
+def _derive_shots(scene: dict) -> list[str]:
+    """
+    Ensure exactly 4 shot prompts exist for each scene.
+    Prefer upstream `shots` when valid; otherwise synthesize camera-varied shots.
+    """
+    raw = scene.get("shots", [])
+    shots = [str(s).strip() for s in raw if isinstance(s, str) and str(s).strip()]
+    if len(shots) == 4:
+        return shots
+
+    base = (
+        scene.get("scene_visual_cue", "")
+        or scene.get("visual_cue", "")
+        or scene.get("action_description", "")
+        or f"{scene.get('location', 'cinematic location')}, cinematic lighting, highly detailed"
+    ).strip()
+    cams = [
+        "wide shot, establishing frame",
+        "medium shot, character focus",
+        "over-shoulder shot, interaction detail",
+        "close-up shot, emotional detail",
+    ]
+    return [f"{base}, {cam}" for cam in cams]
+
+
 # ─── Main serialization ──────────────────────────────────────────────────────
 
 def serialize(phase1_outputs: Path, out_dir: Path):
@@ -150,6 +175,7 @@ def serialize(phase1_outputs: Path, out_dir: Path):
             action_description = s.get("action_description", ""),
             dialogue           = dialogue,
             scene_visual_cue   = s.get("scene_visual_cue", ""),
+            shots              = _derive_shots(s),
             duration_s         = dur,
         ))
 
@@ -190,6 +216,7 @@ def serialize(phase1_outputs: Path, out_dir: Path):
         scene_visuals.append({
             "scene_id":       s.scene_id,
             "visual_prompt":  f"{s.scene_visual_cue}, {s.action_description}, {s.tone} mood",
+            "shots":          s.shots,
             "location":       s.location,
             "time_of_day":    s.time_of_day,
             "camera":         "medium_shot",

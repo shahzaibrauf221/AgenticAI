@@ -24,11 +24,12 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from moviepy import VideoFileClip, vfx
+from moviepy import AudioFileClip, ImageClip, VideoFileClip, concatenate_videoclips, vfx
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
 from agents.video_agent.state import AgentState
+from shared.utils.pollinations_client import fetch_pollinations_image
 
 # ─── MCP client ──────────────────────────────────────────────────────────────
 
@@ -346,6 +347,56 @@ def _mux_scene_audio(video_path: str, audio_path: str, duration_s: float) -> str
     except Exception:
         pass
     return video_path
+
+
+def _build_default_shots(scene: dict) -> list[str]:
+    """Fallback 4-shot prompt plan for legacy scripts without shots[]."""
+    base = (
+        scene.get("scene_visual_cue", "")
+        or scene.get("visual_cue", "")
+        or scene.get("action_description", "")
+        or f"{scene.get('location', 'cinematic location')}, cinematic lighting, highly detailed"
+    ).strip()
+    cams = [
+        "wide shot, establishing frame",
+        "medium shot, character focus",
+        "over-shoulder shot, interaction detail",
+        "close-up shot, emotional detail",
+    ]
+    return [f"{base}, {cam}" for cam in cams]
+
+
+def _make_ken_burns_clip(image_path: str, shot_duration: float, zoom_delta: float = 0.05) -> ImageClip:
+    """
+    Create an ImageClip with subtle Ken Burns zoom-in.
+    """
+    clip = ImageClip(image_path).with_duration(shot_duration)
+    # Gradual zoom from 1.0 -> (1.0 + zoom_delta) over shot duration.
+    return clip.resized(lambda t: 1.0 + zoom_delta * (t / max(0.001, shot_duration)))
+
+
+def _compose_scene_from_images(image_paths: list[str], output_path: Path, total_duration: float) -> str:
+    """
+    Compose a scene MP4 from 4 still images using Ken Burns + 0.5s crossfade.
+    """
+    valid = [p for p in image_paths if p and Path(p).exists()]
+    if not valid:
+        return ""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    shot_duration = max(0.8, float(total_duration) / max(1, len(valid)))
+    crossfade_s = 0.5
+    clips = [_make_ken_burns_clip(p, shot_duration) for p in valid]
+    try:
+        scene_clip = concatenate_videoclips(clips, method="compose", padding=-crossfade_s)
+        scene_clip.write_videofile(str(output_path), fps=24, logger=None)
+        scene_clip.close()
+        return str(output_path) if output_path.exists() else ""
+    finally:
+        for c in clips:
+            try:
+                c.close()
+            except Exception:
+                pass
 
 
 def _concat_video_shots(shot_paths: list[str], out_path: Path) -> str:
@@ -789,64 +840,31 @@ async def video_gen_node(state: AgentState) -> dict:
     print(f"  [Video Gen    | scene {sid}] Rendering {duration:.1f}s "
           f"({n_dialogue} dialogue lines, {n_actions} action beats)")
 
-    # ── Build SD1.5-friendly compact tagged prompt ────────────────────────────
-    def _compact_tags(text: str) -> str:
-        parts = [p.strip() for p in (text or "").replace("\n", ",").split(",")]
-        keep = []
-        for p in parts:
-            if p and p not in keep:
-                keep.append(p)
-        return ", ".join(keep[:18])
+    # ── Animatic pivot: 4 Pollinations shots -> Ken Burns scene clip ─────────
+    shots = scene.get("shots", [])
+    if not isinstance(shots, list) or len(shots) != 4:
+        shots = _build_default_shots(scene)
+    shots = [str(s).strip() for s in shots if str(s).strip()][:4]
+    if len(shots) < 4:
+        shots = (shots + _build_default_shots(scene))[:4]
 
-    visual_cue = scene.get("scene_visual_cue", "") or scene.get("visual_cue", "")
-    location = scene.get("location", "")
-    mood = scene.get("mood", "") or scene.get("tone", "")
+    montage_dir = Path(__file__).resolve().parent.parent.parent / "montage_outputs"
+    montage_dir.mkdir(parents=True, exist_ok=True)
+    sid_num = int(sid) if str(sid).isdigit() else 0
 
-    # Prefer the curated scene_visual_cue tags from writer over verbose prose.
-    base_tags = _compact_tags(visual_cue)
-    if not base_tags:
-        base_tags = _compact_tags(f"{location}, {mood}, medium shot, cinematic")
+    shot_image_paths = [
+        montage_dir / f"scene{sid_num}_shot{i+1}.png"
+        for i in range(4)
+    ]
+    # Download storyboard frames sequentially to avoid API burst throttling (429).
+    for i in range(4):
+        await fetch_pollinations_image(shots[i], str(shot_image_paths[i]))
 
-    # Add a few stable quality anchors (kept short for SD token budget).
-    prompt_text = _compact_tags(
-        f"{base_tags}, coherent composition, detailed face, realistic skin, cinematic lighting, sharp focus"
+    raw_video = _compose_scene_from_images(
+        [str(p) for p in shot_image_paths],
+        montage_dir / f"scene{sid_num}_raw.mp4",
+        duration,
     )
-    neg_prompt = (
-        "worst quality, low quality, lowres, blurry, noisy, grainy, jpeg artifacts, text, watermark, logo, "
-        "deformed, disfigured, bad anatomy, extra limbs, extra fingers, mutated face, duplicate face"
-    )
-    
-    seed = state.get("global_seed", -1)
-    # Cross-scene img2img carry-over often causes "visual noise soup" on SD1.5.
-    use_init_image = os.getenv("ENABLE_INIT_IMAGE_CARRY", "0").strip() in {"1", "true", "yes"}
-    init_image = state.get("last_scene_frame_b64", "") if use_init_image else ""
-    denoising = 0.20 if init_image else 0.0
-
-    # Minimal mode: one generation call per scene.
-    # Keep source clip length short/stable for AnimateDiff (high frame counts can
-    # destabilize into noisy outputs on many SD1.5 checkpoints).
-    gen_frames = int(os.getenv("GEN_SOURCE_FRAMES", "16") or 16)
-    gen_frames = max(8, min(24, gen_frames))
-    gen_width = int(os.getenv("GEN_WIDTH", "512") or 512)
-    gen_height = int(os.getenv("GEN_HEIGHT", "512") or 512)
-    # Ensure dimensions are multiples of 64 for SD pipelines.
-    gen_width = max(256, (gen_width // 64) * 64)
-    gen_height = max(256, (gen_height // 64) * 64)
-
-    raw = await _call_tool(
-        "query_stock_footage",
-        scene_id=sid,
-        prompt=prompt_text,
-        num_frames=gen_frames,
-        width=gen_width,
-        height=gen_height,
-        seed=seed if isinstance(seed, int) else -1,
-        negative_prompt=neg_prompt,
-        denoising_strength=denoising,
-        init_image_b64=init_image,
-    )
-    base = _safe_parse(raw)
-    raw_video = base.get("file", "")
 
     # Final trim/fit to exact target audio duration.
     base_video = _sync_clip_duration(raw_video, duration) if raw_video else raw_video

@@ -203,19 +203,24 @@ Use exactly this structure:
           "visual_cue": "how they look or move while saying it"
         }}
       ],
-      "scene_visual_cue": "overall visual description of the scene"
+      "shots": [
+        "shot 1 visual prompt tags",
+        "shot 2 visual prompt tags",
+        "shot 3 visual prompt tags",
+        "shot 4 visual prompt tags"
+      ]
     }}
   ]
 }}
 Fill in ALL fields with real content. Do not use placeholder words like 'string' or 'name'.
-IMPORTANT RULES for scene_visual_cue (STRICT for SD1.5/AnimateDiff):
-1. COMPACT TAG FORMAT (MANDATORY): Write `scene_visual_cue` as comma-separated visual tags, not prose. Keep under 40 words total.
-2. GENDER/ANATOMY ENFORCEMENT (MANDATORY): For every on-screen character, explicitly include gender + age + build in tags (example: "30-year-old male, tall, broad shoulders").
-3. STRICT CONTINUITY (MANDATORY): Repeat core setting/background tags in EVERY scene (location, lighting, time/weather style), even if unchanged.
-4. CAMERA TAGS (MANDATORY): Include at least one camera/framing tag (example: "medium shot", "close-up", "tracking shot", "over-shoulder").
-5. DIALOGUE LENGTH (MANDATORY): Every scene MUST include 2–3 dialogue entries. Single-line scenes are forbidden. Each "line" is ONE natural conversational sentence capped at ~22 words (no monologues; keep punchy exchanges).
-6. STORY PROGRESSION (MANDATORY): Adjacent scenes must show clear progression (new beat, action change, or reveal), not rephrased duplicates.
-7. OUTPUT SAFETY: Keep `scene_visual_cue` physically descriptive only. No metaphors, internal thoughts, or abstract themes.
+IMPORTANT RULES for shots (STRICT):
+1. EXACT COUNT: Every scene MUST include exactly 4 strings in `shots`. No more, no fewer.
+2. TAG FORMAT: Each shot MUST be comma-separated visual tags suitable for image generation (no prose paragraphs).
+3. CAMERA VARIETY: The 4 shots must represent distinct camera angles/moments (e.g., wide establishing, medium character shot, over-shoulder detail, close-up reveal).
+4. CONTINUITY: Repeat essential setting/background tags in ALL 4 shots for the same scene.
+5. CHARACTER CONSISTENCY: When a character appears in a shot, include explicit gender + age + build tags.
+6. QUALITY: Include cinematic quality tags like "highly detailed", "cinematic lighting", "sharp focus" where appropriate.
+7. DIALOGUE LENGTH (MANDATORY): Every scene MUST include 2–3 dialogue entries. Single-line scenes are forbidden. Each "line" is ONE natural conversational sentence capped at ~22 words.
 8. QUALITY CHECK BEFORE RETURN: If any scene violates rules 1-7, rewrite it before returning JSON."""
 
     return _llm(system, prompt)
@@ -320,6 +325,21 @@ def validate_script(script_json: str) -> str:
                     suggestions.append(
                         f"Scene {sid}, dialogue {j}: add a 'visual_cue' "
                         f"describing blocking, expression, or camera note."
+                    )
+
+        # Shot prompts check (Animatic pivot)
+        shots = scene.get("shots", [])
+        if not isinstance(shots, list) or len(shots) != 4:
+            errors.append(f"Scene {sid}: 'shots' must be an array of exactly 4 strings.")
+            suggestions.append(
+                f"Scene {sid}: provide exactly 4 shot prompts in comma-separated tag format."
+            )
+        else:
+            for k, shot in enumerate(shots, 1):
+                if not isinstance(shot, str) or not shot.strip():
+                    errors.append(f"Scene {sid}, shot {k}: must be a non-empty string.")
+                    suggestions.append(
+                        f"Scene {sid}, shot {k}: add comma-separated visual tags."
                     )
 
     return json.dumps({

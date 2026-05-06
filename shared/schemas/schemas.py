@@ -51,12 +51,21 @@ class Scene(BaseModel):
     action_description: str                  = ""
     dialogue:           List[DialogueLine]   = Field(default_factory=list)
     scene_visual_cue:   str                  = ""
+    shots:              List[str]            = Field(default_factory=list)
     duration_s:         float                = 5.0              # NEW — per-scene duration
 
     @field_validator("duration_s")
     @classmethod
     def duration_positive(cls, v: float) -> float:
         return max(1.0, float(v))
+
+    @field_validator("shots")
+    @classmethod
+    def shots_exactly_four(cls, v: List[str]) -> List[str]:
+        shots = [str(s).strip() for s in (v or []) if str(s).strip()]
+        if len(shots) != 4:
+            raise ValueError("shots must contain exactly 4 non-empty prompts")
+        return shots
 
 
 # ─── Top-level State Objects ─────────────────────────────────────────────────
