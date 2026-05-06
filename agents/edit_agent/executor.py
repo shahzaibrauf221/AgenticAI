@@ -25,6 +25,7 @@ import httpx
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
 from agents.edit_agent.state import EditAgentState
+from agents.edit_agent.tools.opencv_filters import apply_filter_to_image
 from state_manager.manager import StateManager
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -141,6 +142,8 @@ async def execute_edit(state: EditAgentState) -> EditAgentState:
     scope      = state.get("scope",      "all")
     parameters = state.get("parameters", {})
     version    = state.get("current_version", StateManager.latest_version() or "v1")
+    rerun_from = state.get("rerun_from", "phase3")
+    rerun_pipeline = bool(state.get("rerun_pipeline", False))
 
     logs: list[str] = [f"[executor] intent={intent} target={target} scope={scope}"]
     result: dict    = {}
@@ -169,6 +172,21 @@ async def execute_edit(state: EditAgentState) -> EditAgentState:
         ]
 
         asset_paths = result.get("asset_paths", [])
+
+        if rerun_pipeline:
+            logs.append(f"[executor] rerun requested from {rerun_from}")
+            from agents.orchestrator.pipeline import run_targeted_rerun
+
+            pipeline_result = await run_targeted_rerun(
+                entry_phase=rerun_from,
+                phase1_dir=_PROJECT_ROOT / "data" / "outputs",
+                prompt=parameters.get("prompt", current_state.get("user_prompt", "")),
+            )
+            result["pipeline_rerun"] = pipeline_result
+            phase3 = pipeline_result.get("phase3", {})
+            if isinstance(phase3, dict) and phase3.get("final_video"):
+                asset_paths.append(str(phase3["final_video"]))
+
         new_version = StateManager.snapshot(
             state=current_state,
             asset_paths=asset_paths,
@@ -407,52 +425,7 @@ _FILTER_PRESETS: dict[str, dict] = {
 
 
 def _apply_filter(image_path: Path, filter_name: str, output_path: Path) -> bool:
-    preset = _FILTER_PRESETS.get(filter_name, {})
-    try:
-        import cv2, numpy as np
-        img = cv2.imread(str(image_path))
-        if img is None:
-            raise ValueError("cv2 could not read image")
-
-        if preset.get("grayscale"):
-            img = cv2.cvtColor(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
-
-        if preset.get("sepia"):
-            k   = np.array([[0.272,0.534,0.131],[0.349,0.686,0.168],[0.393,0.769,0.189]])
-            img = np.clip(cv2.transform(img, k), 0, 255).astype(np.uint8)
-
-        if b := preset.get("brightness"):
-            img = cv2.convertScaleAbs(img, alpha=b, beta=0)
-
-        if c := preset.get("contrast"):
-            if c != 1.0:
-                img = cv2.convertScaleAbs(img, alpha=c, beta=128*(1-c))
-
-        if s := preset.get("saturation"):
-            hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
-            hsv[:,:,1] = np.clip(hsv[:,:,1]*s, 0, 255)
-            img = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
-
-        if h := preset.get("hue_shift"):
-            hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
-            hsv[:,:,0] = (hsv[:,:,0] + h) % 180
-            img = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
-
-        cv2.imwrite(str(output_path), img)
-        return True
-
-    except Exception:
-        try:
-            from PIL import Image, ImageEnhance
-            img = Image.open(image_path).convert("RGB")
-            if b := preset.get("brightness"):
-                img = ImageEnhance.Brightness(img).enhance(b)
-            if c := preset.get("contrast"):
-                img = ImageEnhance.Contrast(img).enhance(c)
-            img.save(output_path)
-            return True
-        except Exception:
-            return False
+    return apply_filter_to_image(image_path=image_path, filter_name=filter_name, output_path=output_path)
 
 
 async def _handle_video_frame_edit(intent: str, scope: str, parameters: dict, state: dict, logs: list[str]) -> dict:

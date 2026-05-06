@@ -97,14 +97,18 @@ class StateManager:
 
     @staticmethod
     def snapshot(
-        state: dict,
+        state: dict | None = None,
         asset_paths: list[str] | None = None,
         label: str = "pipeline run",
+        version: str | None = None,
+        state_json: dict | None = None,
     ) -> str:
         """Persist state + copy assets. Returns new version tag."""
+        if state is None:
+            state = state_json or {}
         asset_paths = asset_paths or []
         conn = _get_conn()
-        version = _next_version(conn)
+        version = version or _next_version(conn)
 
         prev_row = conn.execute(
             "SELECT state_json FROM versions ORDER BY id DESC LIMIT 1"

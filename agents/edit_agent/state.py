@@ -23,6 +23,8 @@ class EditAgentState(TypedDict):
     plan:        list[str]     # steps the executor will take
     result:      dict          # output from executor
     new_version: str           # version tag after snapshot
+    rerun_from: str            # phase1 | phase2 | phase3
+    rerun_pipeline: bool       # whether to re-enter orchestrator pipeline
 
     # ── Pipeline control ───────────────────────────────────
     status:      str           # "classifying" | "planning" | "executing" | "done" | "failed"

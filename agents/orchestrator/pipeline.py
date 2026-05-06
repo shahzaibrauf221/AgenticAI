@@ -172,6 +172,49 @@ async def run_all(prompt: str, output_dir: Path,
     }
 
 
+async def run_targeted_rerun(
+    entry_phase: str,
+    phase1_dir: Path,
+    prompt: str = "",
+) -> dict:
+    """
+    Re-enter pipeline at a specific phase for edit operations.
+    entry_phase:
+      - phase1: run 1 -> 2 -> 3
+      - phase2: run 2 -> 3
+      - phase3: run 3 only
+    """
+    phase1_dir.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("HITL_AUTO_APPROVE", "1")
+
+    p1_result: dict = {}
+    p2_result: dict = {}
+    p3_result: dict = {}
+
+    if entry_phase == "phase1":
+        p1_result = await run_phase1(prompt, phase1_dir)
+        if p1_result.get("status") == "failed":
+            return {"phase1": p1_result}
+        p2_result = await run_phase2(phase1_dir)
+        if p2_result.get("status") == "failed":
+            return {"phase1": p1_result, "phase2": p2_result}
+        p3_result = await run_phase3(phase1_dir, p2_result.get("audio_tracks", {}) or {})
+        return {"phase1": p1_result, "phase2": p2_result, "phase3": p3_result}
+
+    if entry_phase == "phase2":
+        p2_result = await run_phase2(phase1_dir)
+        if p2_result.get("status") == "failed":
+            return {"phase2": p2_result}
+        p3_result = await run_phase3(phase1_dir, p2_result.get("audio_tracks", {}) or {})
+        return {"phase2": p2_result, "phase3": p3_result}
+
+    if entry_phase == "phase3":
+        p3_result = await run_phase3(phase1_dir, audio_tracks={})
+        return {"phase3": p3_result}
+
+    raise ValueError(f"Unsupported entry_phase '{entry_phase}'")
+
+
 # ─── CLI ─────────────────────────────────────────────────────────────────────
 
 def main():

@@ -168,6 +168,7 @@
   .small  { font-size: 11px; color: var(--fg-dim); }
   .pill   { display: inline-block; padding: 2px 8px; border-radius: 10px;
             background: var(--bg-elev); border: 1px solid var(--border); font-size: 11px; }
+  .mono { font-family: var(--mono); font-size: 12px; }
   hr { border: none; border-top: 1px solid var(--border); margin: 14px 0; }
 </style>
 </head>
@@ -219,6 +220,28 @@
       <div class="logs" id="logs"></div>
     </div>
 
+    <div class="card">
+      <h2>Edit & Undo</h2>
+      <div class="small" style="margin-bottom:8px;">
+        Current version: <span id="editCurrentVersion" class="pill mono">loading…</span>
+      </div>
+      <textarea id="editQuery" rows="3" placeholder="e.g. Make scene 2 darker and keep dialogue same"></textarea>
+      <div style="margin-top:10px;" class="row">
+        <button id="btnRunEdit" class="primary">Apply edit</button>
+        <button id="btnRefreshEdit">Refresh history</button>
+      </div>
+      <div style="margin-top:10px;">
+        <label class="small" for="revertVersion">Revert to version</label>
+        <div class="row" style="margin-top:4px;">
+          <input id="revertVersion" class="mono" placeholder="v1"/>
+          <button id="btnRevert">Revert</button>
+        </div>
+      </div>
+      <hr/>
+      <div id="editResult" class="small">No edit executed yet.</div>
+      <div id="editHistory" class="logs" style="height:180px; margin-top:10px;"></div>
+    </div>
+
   </div>
 
   <!-- ── RIGHT COLUMN ───────────────────────────── -->
@@ -265,6 +288,8 @@
 const API = "";   // Same-origin
 let currentJob = null;
 let evtSource  = null;
+let editSessionId = "ui-session-main";
+let currentEditVersion = null;
 
 const $ = (id) => document.getElementById(id);
 const logsEl     = $("logs");
@@ -298,6 +323,11 @@ function setPhaseState(phase, state) {
   if (!el) return;
   el.classList.remove("active", "done", "failed");
   if (state) el.classList.add(state);
+}
+
+function setCurrentEditVersion(version) {
+  currentEditVersion = version || null;
+  $("editCurrentVersion").textContent = currentEditVersion || "none";
 }
 function resetPhases() {
   ["phase1", "phase2", "phase3"].forEach(p => setPhaseState(p, ""));
@@ -393,6 +423,123 @@ async function refreshOutputs() {
   }
 }
 
+// ─── Edit Agent API calls ────────────────────────────────────
+
+async function refreshLatestEditVersion() {
+  try {
+    const r = await fetch(API + "/api/edit/latest");
+    if (!r.ok) return;
+    const data = await r.json();
+    setCurrentEditVersion(data.version || null);
+  } catch (e) {
+    console.error("refreshLatestEditVersion failed", e);
+  }
+}
+
+async function refreshEditHistory() {
+  try {
+    const r = await fetch(API + "/api/edit/history");
+    if (!r.ok) {
+      $("editHistory").innerHTML = `<div class="line error">Failed to load history (${r.status})</div>`;
+      return;
+    }
+    const rows = await r.json();
+    if (!Array.isArray(rows) || rows.length === 0) {
+      $("editHistory").innerHTML = `<div class="line log">No snapshots yet.</div>`;
+      return;
+    }
+    $("editHistory").innerHTML = rows.map((h) => {
+      return `<div class="line log">` +
+        `<span class="pill mono">${escapeHtml(h.version)}</span> ` +
+        `${escapeHtml(h.label || "")} ` +
+        `<span class="small">(${escapeHtml(h.diff_summary || "minor update")})</span>` +
+        `</div>`;
+    }).join("");
+  } catch (e) {
+    $("editHistory").innerHTML = `<div class="line error">${escapeHtml(String(e))}</div>`;
+  }
+}
+
+async function runEditCommand() {
+  const query = $("editQuery").value.trim();
+  if (!query) {
+    alert("Enter an edit command first.");
+    return;
+  }
+
+  $("btnRunEdit").disabled = true;
+  $("editResult").textContent = "Running edit...";
+  appendLog("phase", `→ Edit: ${query}`);
+
+  try {
+    const r = await fetch(API + "/api/edit/run", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        query,
+        current_version: currentEditVersion,
+        session_id: editSessionId,
+      }),
+    });
+    const data = await r.json();
+    if (!r.ok) {
+      $("editResult").innerHTML = `<span style="color:var(--err)">Edit failed: ${escapeHtml(data.detail || r.statusText)}</span>`;
+      appendLog("error", `Edit failed: ${data.detail || r.statusText}`);
+      return;
+    }
+
+    setCurrentEditVersion(data.new_version || currentEditVersion);
+    const short = `${data.intent || "unknown"} [${data.target || "?"}] scope=${data.scope || "all"} => ${data.status || "unknown"}`;
+    $("editResult").innerHTML = `<span style="color:var(--ok)">✓ ${escapeHtml(short)}</span>`;
+    appendLog("done", `Edit applied: ${short}`);
+
+    if (Array.isArray(data.logs)) {
+      data.logs.slice(-3).forEach((l) => appendLog("log", `[edit] ${l}`));
+    }
+
+    await refreshEditHistory();
+    await refreshOutputs();
+  } catch (e) {
+    $("editResult").innerHTML = `<span style="color:var(--err)">Edit failed: ${escapeHtml(String(e))}</span>`;
+    appendLog("error", `Edit failed: ${String(e)}`);
+  } finally {
+    $("btnRunEdit").disabled = false;
+  }
+}
+
+async function revertEditVersion() {
+  const version = $("revertVersion").value.trim();
+  if (!version) {
+    alert("Enter a version like v2.");
+    return;
+  }
+
+  $("btnRevert").disabled = true;
+  try {
+    const r = await fetch(API + "/api/edit/revert", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({version}),
+    });
+    const data = await r.json();
+    if (!r.ok) {
+      $("editResult").innerHTML = `<span style="color:var(--err)">Revert failed: ${escapeHtml(data.detail || r.statusText)}</span>`;
+      appendLog("error", `Revert failed: ${data.detail || r.statusText}`);
+      return;
+    }
+    setCurrentEditVersion(version);
+    $("editResult").innerHTML = `<span style="color:var(--ok)">↩ ${escapeHtml(data.message || `Reverted to ${version}`)}</span>`;
+    appendLog("done", `Reverted to ${version}`);
+    await refreshEditHistory();
+    await refreshOutputs();
+  } catch (e) {
+    $("editResult").innerHTML = `<span style="color:var(--err)">Revert failed: ${escapeHtml(String(e))}</span>`;
+    appendLog("error", `Revert failed: ${String(e)}`);
+  } finally {
+    $("btnRevert").disabled = false;
+  }
+}
+
 function renderOutputs(data) {
   // Final video
   const finalArea = $("finalVideoArea");
@@ -485,9 +632,17 @@ $("btnPhase3").onclick = () => {
 };
 $("btnClearLog").onclick = () => { logsEl.innerHTML = ""; };
 $("btnRefresh").onclick  = refreshOutputs;
+$("btnRunEdit").onclick = runEditCommand;
+$("btnRefreshEdit").onclick = async () => {
+  await refreshLatestEditVersion();
+  await refreshEditHistory();
+};
+$("btnRevert").onclick = revertEditVersion;
 
 // Initial state
 refreshOutputs();
+refreshLatestEditVersion();
+refreshEditHistory();
 appendLog("phase", "Ready. Enter a prompt and click Run.");
 </script>
 

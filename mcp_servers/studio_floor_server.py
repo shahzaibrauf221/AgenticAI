@@ -47,7 +47,7 @@ from shared.utils.bytedance_video_client import (
 )
 
 # ─── Load .env ────────────────────────────────────────────────────────────────
-def _load_env():
+def _load_env(force_override: bool = False):
     for candidate in [
         Path(__file__).parent.parent / ".env",
         Path(__file__).parent / ".env",
@@ -60,11 +60,17 @@ def _load_env():
                 key, _, value = line.partition("=")
                 key = key.strip()
                 value = value.strip().strip('"').strip("'")
-                if key and value and key not in os.environ:
+                if not key or not value:
+                    continue
+                # Prefer project .env for API keys/model endpoints to avoid stale
+                # inherited shell values causing hard-to-debug 404/401 responses.
+                if force_override or key.endswith("_API_KEY") or key.startswith("BYTEDANCE_"):
+                    os.environ[key] = value
+                elif key not in os.environ:
                     os.environ[key] = value
             break
 
-_load_env()
+_load_env(force_override=True)
 
 # ─── Init ─────────────────────────────────────────────────────────────────────
 mcp = FastMCP("studio_floor", port=8200)
@@ -611,6 +617,7 @@ def query_stock_footage(
                 width=width,
                 height=height,
                 seed=seed,
+                image_url=(os.environ.get("BYTEDANCE_I2V_IMAGE_URL", "").strip() or None),
                 **shot_kw,
             )
             local_path = Path(local_file)
@@ -1039,8 +1046,12 @@ def query_memory(category: str = "", keyword: str = "", limit: int = 50) -> str:
 
 
 if __name__ == "__main__":
+    # Refresh critical env at runtime start (protect against stale shell env).
+    _load_env(force_override=True)
     print(f"[Studio Floor MCP] starting on port 8200")
     print(f"[Studio Floor MCP] ffmpeg available: {_has_ffmpeg()}")
+    print(f"[Studio Floor MCP] BYTEDANCE_API_BASE_URL: {os.environ.get('BYTEDANCE_API_BASE_URL', '')}")
+    print(f"[Studio Floor MCP] BYTEDANCE_MODEL: {os.environ.get('BYTEDANCE_MODEL', '')}")
     print(f"[Studio Floor MCP] Phase 1 image search paths:")
     for p in _find_phase1_image_dir():
         print(f"    {p}  ({len(list(p.glob('*.png')))} PNGs)")

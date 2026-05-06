@@ -36,8 +36,7 @@ _PLANS: dict[str, list[str]] = {
     "script": [
         "load_current_state",
         "apply_script_edit",
-        "cascade_to_audio",
-        "cascade_to_video",
+        "rerun_pipeline_from_phase1_if_requested",
         "snapshot_state",
     ],
 }

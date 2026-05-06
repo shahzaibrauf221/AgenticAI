@@ -314,6 +314,41 @@ def _sync_clip_duration(raw_video: str, target_duration: float) -> str:
             pass
 
 
+def _mux_scene_audio(video_path: str, audio_path: str, duration_s: float) -> str:
+    """
+    Attach scene audio to scene video (no lip-sync step).
+    Returns muxed video path, or original path on failure.
+    """
+    if not video_path or not Path(video_path).exists():
+        return video_path
+    if not audio_path or not Path(audio_path).exists() or not _has_ffmpeg():
+        return video_path
+
+    in_v = Path(video_path)
+    out_v = in_v.with_name(f"{in_v.stem}_aud.mp4")
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-stream_loop", "-1", "-i", str(in_v),
+                "-i", str(Path(audio_path)),
+                "-t", str(max(0.5, float(duration_s))),
+                "-map", "0:v:0", "-map", "1:a:0",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "128k",
+                "-shortest",
+                str(out_v),
+            ],
+            check=True,
+            timeout=180,
+        )
+        if out_v.exists() and out_v.stat().st_size > 0:
+            return str(out_v)
+    except Exception:
+        pass
+    return video_path
+
+
 def _concat_video_shots(shot_paths: list[str], out_path: Path) -> str:
     """Concatenate multiple generated shots into one scene clip."""
     valid = [p for p in shot_paths if p and Path(p).exists()]
@@ -756,102 +791,46 @@ async def video_gen_node(state: AgentState) -> dict:
     print(f"  [Video Gen    | scene {sid}] Rendering {duration:.1f}s "
           f"({n_dialogue} dialogue lines, {n_actions} action beats)")
 
-    # ── Build a rich SD prompt from all available scene metadata ──────────────
-    prompt_parts = []
-    
-    # 1. Identify primary speaking character
-    speaker = None
-    if scene.get("dialogue"):
-        speaker = scene["dialogue"][0]["speaker"]
-    elif chars:
-        speaker = chars[0]
-        
-    char_db = state.get("character_db", {}).get("characters", [])
-    char_map = {c["name"]: c for c in char_db}
-    
-    # 2. Frame the shot around the speaker so Wav2Lip has a face, but keep it a medium shot
-    if speaker and speaker in char_map:
-        cinfo = char_map[speaker]
-        appearance = cinfo.get("appearance", "")
-        costume = cinfo.get("costume", "")
-        # Medium shot avoids "huge floating faces" by including the upper body
-        prompt_parts.append(
-            f"Cinematic medium shot of {speaker}, {appearance}, wearing {costume}, "
-            "standing in scene, speaking"
-        )
-    elif chars:
-        prompt_parts.append(f"Cinematic medium shot of a person standing in scene")
-
-    # 3. Add ONLY the pure visual background cue, avoid abstract action descriptions
+    # ── Single-call Seedance prompt per scene ─────────────────────────────────
     visual_cue = scene.get("scene_visual_cue", "") or scene.get("visual_cue", "")
-    if visual_cue:
-        prompt_parts.append(f"Background: {visual_cue}")
-        
     location = scene.get("location", "")
-    if location:
-        prompt_parts.append(f"set in {location}")
-        
     mood = scene.get("mood", "") or scene.get("tone", "")
-    if mood:
-        prompt_parts.append(f"{mood} atmosphere")
-    
-    # Keep prompt physically descriptive and character-consistent.
+    # Keep this compact and deterministic for better model adherence.
+    prompt_parts = [p for p in [visual_cue, location, mood] if p]
     prompt_text = ", ".join(prompt_parts) if prompt_parts else f"cinematic scene at {location or 'unknown location'}"
-    neg_prompt = "morphed face, distorted anatomy, extra limbs, low resolution, blurry, mutated"
-    
+    neg_prompt = "low quality, blurry, distorted anatomy, extra limbs, noisy, artifacts"
+
     seed = state.get("global_seed", -1)
-    init_image = state.get("last_scene_frame_b64", "")
-    denoising = 0.38 if init_image else 0.0
-
-    # Build scene from multiple fresh generated shots (instead of one looped clip).
-    shot_target_s = max(1.5, float(os.getenv("SHOT_DURATION_S", "2.0") or 2.0))
-    shot_count = max(1, min(24, math.ceil(duration / shot_target_s)))
-    shot_files: list[str] = []
-    for i in range(shot_count):
-        # Vary seed and camera framing text to avoid visual repetition.
-        shot_seed = (int(seed) + i * 97) if isinstance(seed, int) and seed >= 0 else -1
-        shot_prompt = f"{prompt_text}, shot {i + 1}/{shot_count}, cinematic continuity"
-        raw = await _call_tool(
-            "query_stock_footage",
-            scene_id=sid,
-            prompt=shot_prompt,
-            num_frames=16,
-            width=512,
-            height=512,
-            seed=shot_seed,
-            negative_prompt=neg_prompt,
-            denoising_strength=0.15 if i > 0 else denoising,
-            init_image_b64=init_image if i == 0 else "",
-        )
-        base = _safe_parse(raw)
-        shot_file = base.get("file", "")
-        if shot_file and Path(shot_file).exists():
-            shot_files.append(shot_file)
-
-    sid_num = int(sid) if str(sid).isdigit() else 0
-    stitched_path = Path(__file__).resolve().parent.parent.parent / "outputs" / "video" / f"scene_{sid_num:02d}_stitched.mp4"
-    raw_video = _concat_video_shots(shot_files, stitched_path)
+    raw = await _call_tool(
+        "query_stock_footage",
+        scene_id=sid,
+        prompt=prompt_text,
+        num_frames=16,
+        width=512,
+        height=512,
+        seed=seed if isinstance(seed, int) else -1,
+        negative_prompt=neg_prompt,
+        denoising_strength=0.0,
+        init_image_b64="",
+    )
+    base = _safe_parse(raw)
+    raw_video = base.get("file", "")
 
     # Final trim/fit to exact target audio duration.
     base_video = _sync_clip_duration(raw_video, duration) if raw_video else raw_video
 
-    # Extract last frame for temporal consistency in NEXT scene
-    last_frame_b64 = ""
-    try:
-        import base64
-        import PIL.Image
-        import io
-        import numpy as np
-        # Open final base_video to get the last frame
-        tmp_clip = VideoFileClip(base_video)
-        last_frame_arr = tmp_clip.get_frame(tmp_clip.duration - 0.1)
-        img = PIL.Image.fromarray(last_frame_arr.astype('uint8'))
-        buffered = io.BytesIO()
-        img.save(buffered, format="PNG")
-        last_frame_b64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
-        tmp_clip.close()
-    except Exception as e:
-        print(f"  [Video Gen    | scene {sid}] ⚠ Failed to extract last frame: {e}")
+    # Attach mixed scene audio.
+    skey = str(sid)
+    audio_entry = (state.get("audio_tracks") or {}).get(skey, {})
+    audio_mix = Path(__file__).resolve().parent.parent.parent / "outputs" / "audio" / f"scene_{int(sid):02d}_full.wav" if str(sid).isdigit() else None
+    audio_src = ""
+    if audio_mix and audio_mix.exists():
+        audio_src = str(audio_mix)
+    elif audio_entry.get("files"):
+        first_audio = audio_entry.get("files", [])[0]
+        if first_audio and Path(first_audio).exists():
+            audio_src = str(first_audio)
+    base_video = _mux_scene_audio(base_video, audio_src, duration) if base_video else base_video
 
     payload = {
         "scene_id":   sid,
@@ -868,9 +847,15 @@ async def video_gen_node(state: AgentState) -> dict:
     )
 
     print(f"  [Video Gen    | scene {sid}] ✓ {base_video} ({duration:.1f}s)")
+    final_entry = {
+        "scene_id": sid,
+        "file": base_video,
+        "status": "video_only",
+        "duration_s": duration,
+    }
     return {
         "video_clips": {str(sid): payload},
-        "last_scene_frame_b64": last_frame_b64
+        "final_scenes": {str(sid): final_entry},
     }
 
 

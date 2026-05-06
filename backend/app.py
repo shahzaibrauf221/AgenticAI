@@ -24,6 +24,7 @@ from fastapi.staticfiles import StaticFiles
 
 from backend.routes.pipeline import router as pipeline_router
 from backend.routes.outputs  import router as outputs_router
+from backend.routes.edit     import router as edit_router
 
 app = FastAPI(
     title="AgenticAI Project — Phase 4 Web Interface",
@@ -41,6 +42,7 @@ app.add_middleware(
 # ─── Routes ──────────────────────────────────────────────────────────────────
 app.include_router(pipeline_router)
 app.include_router(outputs_router)
+app.include_router(edit_router)
 
 # ─── Static asset mounts ─────────────────────────────────────────────────────
 # All generated artifacts live under <root>/outputs/. We expose them at /static/.
