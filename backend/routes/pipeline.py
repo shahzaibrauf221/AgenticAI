@@ -25,9 +25,9 @@ from backend.services import manager
 router = APIRouter(prefix="/api", tags=["pipeline"])
 
 # Project root — assumes backend/ lives at <root>/backend/
-ROOT       = Path(__file__).resolve().parent.parent.parent
-OUTPUTS    = ROOT / "data" / "outputs"
-LEGACY_OUT = ROOT / "outputs"
+ROOT    = Path(__file__).resolve().parent.parent.parent
+# Single canonical outputs dir — MUST match OUTPUT_DIR in writers_room_server.py
+OUTPUTS = ROOT / "outputs"
 
 
 # ─── Request models ─────────────────────────────────────────────────────────
@@ -37,7 +37,7 @@ class FullRunRequest(BaseModel):
 
 
 class PhaseRequest(BaseModel):
-    phase1_dir: str = Field(default="data/outputs",
+    phase1_dir: str = Field(default="outputs",
                             description="Directory with Phase 1 outputs")
     prompt:     str = Field(default="",
                             description="(Phase 1 only) story prompt")
@@ -46,17 +46,14 @@ class PhaseRequest(BaseModel):
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
 def _resolve_phase1_dir(p1: str) -> Path:
-    """Accept absolute or root-relative phase1 dir; pick the one that has files."""
+    """Accept absolute or root-relative phase1 dir; always resolves to canonical OUTPUTS."""
     candidate = Path(p1)
     if not candidate.is_absolute():
         candidate = ROOT / candidate
-    if (candidate / "scene_manifest.json").exists() or (candidate / "script.json").exists():
+    if (candidate / "scene_manifest.json").exists():
         return candidate
-    # Fallback to data/outputs or outputs
-    for alt in (OUTPUTS, LEGACY_OUT):
-        if (alt / "scene_manifest.json").exists() or (alt / "script.json").exists():
-            return alt
-    return candidate   # let the pipeline raise its own error
+    # Always fall back to canonical outputs/ — never data/outputs
+    return OUTPUTS
 
 
 # ─── Routes ─────────────────────────────────────────────────────────────────
@@ -68,7 +65,7 @@ async def run_full(req: FullRunRequest):
     async def _coro(j):
         from agents.orchestrator.pipeline import run_all
         os.environ.setdefault("HITL_AUTO_APPROVE", "1")
-        OUTPUTS.mkdir(parents=True, exist_ok=True)
+        # Do NOT mkdir here — run_all() / _wipe_outputs() manages the directory.
         return await run_all(prompt=req.prompt, output_dir=OUTPUTS)
 
     await manager.run_in_background(job, _coro)

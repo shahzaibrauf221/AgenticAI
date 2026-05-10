@@ -19,6 +19,7 @@ import asyncio
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -122,9 +123,13 @@ def _expected_base_video_path(scene_id: int, location: str = "") -> Path:
     """
     base_dir = Path(__file__).resolve().parent.parent.parent / "outputs" / "video"
     # Prefer an exact match on disk (handles prompt-named files correctly)
-    matches = sorted(base_dir.glob(f"scene_{scene_id:02d}_*.mp4"))
+    matches = sorted(
+        base_dir.glob(f"scene_{scene_id:02d}_*.mp4"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
     if matches:
-        return matches[0]  # first alphabetically; there should only be one per scene
+        return matches[0]  # newest on disk — avoids stale filename after multiple runs
     # Legacy fallback: reconstruct from location (may not exist yet)
     safe_loc = _safe_filename_part(location[:40]) if location else f"scene_{scene_id}"
     return base_dir / f"scene_{scene_id:02d}_{safe_loc}.mp4"
@@ -249,6 +254,152 @@ def _duration_from_state(state: AgentState, scene_id) -> float:
     except (TypeError, ValueError):
         pass
     return 0.0
+
+
+def _disk_audio_tracks_from_mixed_wavs() -> dict[str, dict]:
+    """
+    Read outputs/audio/scene_NN_full.wav and build audio_tracks entries with ffprobe duration.
+
+    Prefer over Chroma audio_track rows when present: Chroma is append-only, so reruns leave
+    multiple historical rows per scene_id unless queries dedupe.
+
+    Matches the paths video_gen_node mux logic already checks for.
+    """
+
+    audio_dir = Path(__file__).resolve().parent.parent.parent / "outputs" / "audio"
+    if not audio_dir.is_dir():
+        return {}
+
+    out: dict[str, dict] = {}
+    for wav in sorted(audio_dir.glob("scene_*_full.wav")):
+        m = re.match(r"scene_(\d+)_full\.wav$", wav.name, re.IGNORECASE)
+        if not m:
+            continue
+        sid = str(int(m.group(1)))
+        dur = float(_get_duration(str(wav)))
+        if dur <= 0:
+            continue
+        out[sid] = {
+            "scene_id":       int(sid),
+            "files":          [str(wav.resolve())],
+            "bgm_file":       "",
+            "mood":           "neutral",
+            "total_duration": round(dur, 3),
+            "_source":        "disk:scene_*_full.wav",
+        }
+    return out
+
+
+def _dedupe_chroma_audio_tracks(entries: list) -> dict[str, dict]:
+    """Latest row per scene_id using metadata timestamp."""
+
+    best: dict[str, tuple[str, dict]] = {}
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            payload = json.loads(entry.get("value") or "{}")
+        except Exception:
+            continue
+        sid_raw = payload.get("scene_id")
+        if sid_raw is None:
+            continue
+        sid = str(sid_raw)
+        ts = str(entry.get("timestamp") or "")
+        prev = best.get(sid)
+        if prev is None or ts >= prev[0]:
+            best[sid] = (ts, payload)
+    return {sid: pl for sid, (_, pl) in best.items()}
+
+
+async def _load_audio_tracks_merged(state: AgentState, scenes: list) -> tuple[dict, list[str]]:
+    logs: list[str] = []
+
+    merged: dict = dict(state.get("audio_tracks") or {})
+    disk_map = _disk_audio_tracks_from_mixed_wavs()
+
+    # On-disk mixed wav always wins — matches ffprobe duration and ffmpeg mux targets.
+    for sid, row in disk_map.items():
+        merged[sid] = row
+    if disk_map:
+        logs.append(f"[Scene Loader] Disk mixed audio overlay for scene(s): {sorted(disk_map.keys())}")
+
+    wanted: set[str] = set()
+    for s in scenes or []:
+        if isinstance(s, dict) and s.get("scene_id") is not None:
+            wanted.add(str(s["scene_id"]))
+
+    missing = sorted(
+        {sid for sid in wanted if float((merged.get(sid) or {}).get("total_duration") or 0.0) <= 0},
+        key=lambda x: int(x) if str(x).isdigit() else 0,
+    )
+    if not missing:
+        logs.append("[Scene Loader] Scene audio durations resolved (disk and/or orchestrator)")
+        return merged, logs
+
+    logs.append("[Scene Loader] MCP Chroma fallback for scenes missing disk/orchestrator audio...")
+    try:
+        mem_raw = await _call_tool("query_memory", category="audio_track", limit=200)
+        mem = _safe_parse(mem_raw)
+        by_sid = _dedupe_chroma_audio_tracks(mem.get("entries") or [])
+        logs.append(f"[Scene Loader] Chroma audio_track rows (deduped): {len(by_sid)} scene(s)")
+        for sid in missing:
+            pl = by_sid.get(sid)
+            if pl and float(pl.get("total_duration") or 0.0) > 0:
+                merged[sid] = pl
+                logs.append(f"[Scene Loader] Chroma audio used for scene {sid}")
+            else:
+                logs.append(f"[Scene Loader] No usable audio payload for scene {sid} — run Phase 2")
+    except Exception as exc:
+        logs.append(f"[Scene Loader] Chroma audio load failed: {exc}")
+
+    return merged, logs
+
+
+def _build_video_gen_prompt(scene: dict, manifest) -> str:
+    """
+    Build the full visual prompt for Seedance / fallback render from the screenplay.
+
+    Previously only scene_visual_cue + location + mood were sent, which drops
+    action_description and story context and makes clips feel "off-topic" vs
+    the user's prompt and dialogue.
+    """
+    m = manifest or {}
+    chunks: list[str] = []
+
+    title = (m.get("title") or "").strip()
+    genre = (m.get("genre") or "").strip()
+    if title or genre:
+        head = title if title else "Untitled"
+        if genre:
+            head = f"{head}, {genre}"
+        chunks.append(head)
+
+    logline = (m.get("logline") or "").strip()
+    if logline:
+        chunks.append(logline)
+
+    visual_cue = (scene.get("scene_visual_cue") or scene.get("visual_cue") or "").strip()
+    if visual_cue:
+        chunks.append(visual_cue)
+
+    action = (scene.get("action_description") or "").strip()
+    if action:
+        chunks.append(action)
+
+    loc = (scene.get("location") or "").strip()
+    tod = (scene.get("time_of_day") or "").strip()
+    if loc or tod:
+        chunks.append(", ".join(p for p in (loc, tod) if p))
+
+    mood = (scene.get("mood") or scene.get("tone") or "").strip()
+    if mood:
+        chunks.append(f"Mood: {mood}")
+
+    text = ". ".join(chunks) if chunks else ""
+    if not text.strip():
+        text = f"cinematic scene at {loc or 'unknown location'}"
+    return text
 
 
 def _build_scene_duration_map(timing_manifest: dict) -> dict:
@@ -620,14 +771,19 @@ async def scene_loader_node(state: AgentState) -> dict:
     # Prefer unified script.json
     if script_path.exists():
         try:
+            print(f"[Scene Loader] script.json path: {script_path.resolve()}")
             unified = json.loads(script_path.read_text(encoding="utf-8"))
+            story = unified.get("story") or {}
             manifest = {
-                "title":  unified.get("story", {}).get("title", "Untitled"),
-                "genre":  unified.get("story", {}).get("genre", ""),
-                "scenes": unified.get("scenes", []),
+                "title":   story.get("title", "Untitled"),
+                "genre":   story.get("genre", ""),
+                "logline": story.get("logline", ""),
+                "themes":  story.get("themes", []) or [],
+                "scenes":  unified.get("scenes", []),
             }
             char_db = {"characters": unified.get("characters", [])}
-            print(f"[Scene Loader] Source: script.json")
+            print(f"[Scene Loader] Source: script.json "
+                  f"— «{manifest.get('title', 'Untitled')}» ({manifest.get('genre', '')})")
         except Exception as e:
             print(f"[Scene Loader] script.json unreadable: {e}")
 
@@ -646,6 +802,11 @@ async def scene_loader_node(state: AgentState) -> dict:
     scenes = manifest.get("scenes", [])
     print(f"[Scene Loader] {len(scenes)} scenes, "
           f"{len(char_db.get('characters', []))} characters")
+    print(
+        "[Scene Loader] Hint: Exported MP4 basename uses the first segment of "
+        "`_build_video_gen_prompt` — usually manifest title/genre plus scene prose. "
+        "If titles match an older project, regenerate Phase 1 (new script.json)."
+    )
 
     # Load Phase 2 timing_manifest.json for precise A/V duration sync.
     timing_manifest = {}
@@ -669,24 +830,10 @@ async def scene_loader_node(state: AgentState) -> dict:
             except Exception as e:
                 print(f"[Scene Loader] timing_manifest unreadable at {candidate}: {e}")
 
-    # Pull Phase 2 audio results from MCP memory if not in state
-    audio_tracks = dict(state.get("audio_tracks") or {})
-    if not audio_tracks:
-        print(f"[Scene Loader] Loading Phase 2 audio from MCP memory...")
-        try:
-            mem_raw = await _call_tool("query_memory", category="audio_track", limit=100)
-            mem = _safe_parse(mem_raw)
-            for entry in mem.get("entries", []):
-                try:
-                    payload = json.loads(entry.get("value", "{}"))
-                    sid = payload.get("scene_id")
-                    if sid is not None:
-                        audio_tracks[str(sid)] = payload
-                except Exception:
-                    continue
-            print(f"[Scene Loader] Loaded audio for {len(audio_tracks)} scene(s) from memory")
-        except Exception as e:
-            print(f"[Scene Loader] Could not load audio from memory: {e}")
+    # Phase 2 audio: orchestrator passes dict; standalone Phase 3 must not trust Chroma blindly.
+    audio_tracks, audio_logs = await _load_audio_tracks_merged(state, scenes)
+    for line in audio_logs:
+        print(line)
 
     # Build task graph
     raw = await _call_tool("get_task_graph", scene_manifest_json=json.dumps(manifest))
@@ -791,14 +938,13 @@ async def video_gen_node(state: AgentState) -> dict:
     print(f"  [Video Gen    | scene {sid}] Rendering {duration:.1f}s "
           f"({n_dialogue} dialogue lines, {n_actions} action beats)")
 
-    # ── Single-call Seedance prompt per scene ─────────────────────────────────
-    visual_cue = scene.get("scene_visual_cue", "") or scene.get("visual_cue", "")
-    location = scene.get("location", "")
-    mood = scene.get("mood", "") or scene.get("tone", "")
-    # Keep this compact and deterministic for better model adherence.
-    prompt_parts = [p for p in [visual_cue, location, mood] if p]
-    prompt_text = ", ".join(prompt_parts) if prompt_parts else f"cinematic scene at {location or 'unknown location'}"
+    # ── Single-call Seedance prompt per scene (full screenplay context) ───────
+    manifest = state.get("scene_manifest") or {}
+    prompt_text = _build_video_gen_prompt(scene, manifest)
     neg_prompt = "low quality, blurry, distorted anatomy, extra limbs, noisy, artifacts"
+
+    print(f"  [Video Gen    | scene {sid}] prompt ({len(prompt_text)} chars): "
+          f"{prompt_text[:240]}{'…' if len(prompt_text) > 240 else ''}")
 
     seed = state.get("global_seed", -1)
     raw = await _call_tool(
@@ -831,6 +977,18 @@ async def video_gen_node(state: AgentState) -> dict:
         if first_audio and Path(first_audio).exists():
             audio_src = str(first_audio)
     base_video = _mux_scene_audio(base_video, audio_src, duration) if base_video else base_video
+
+    # Mirror into raw_scenes/ so outputs match the lip-sync path and are easy to find.
+    if base_video and Path(base_video).exists() and Path(base_video).is_file():
+        raw_scenes = Path(__file__).resolve().parent.parent.parent / "outputs" / "raw_scenes"
+        raw_scenes.mkdir(parents=True, exist_ok=True)
+        try:
+            sid_int = int(sid) if str(sid).isdigit() else 0
+            dest = raw_scenes / (f"scene_{sid_int:02d}.mp4" if sid_int else f"scene_{sid}.mp4")
+            shutil.copy2(base_video, dest)
+            print(f"  [Video Gen    | scene {sid}] mirror → {dest}")
+        except OSError as e:
+            print(f"  [Video Gen    | scene {sid}] ⚠ could not mirror to raw_scenes: {e}")
 
     payload = {
         "scene_id":   sid,

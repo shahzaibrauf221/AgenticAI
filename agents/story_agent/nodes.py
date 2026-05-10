@@ -4,6 +4,7 @@
 # Each node uses MCP tools dynamically — no hardcoded API calls.
 # ============================================================
 
+import asyncio
 import json
 import os
 import re
@@ -12,7 +13,7 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 
 from agents.story_agent.state import AgentState
 
-# ─── MCP Client config ────────────────────────────────────────────────────────
+# ─── MCP Client config ──────────────────────────────────────────────
 
 MCP_CONFIG = {
     "writers_room": {
@@ -21,18 +22,68 @@ MCP_CONFIG = {
     }
 }
 
-# Module-level tool cache — built once per process, reused across all nodes.
-_tool_map: dict = {}
+# Max retries and base delay (seconds) for transient TCP errors (WinError 10054)
+_MCP_RETRIES = 3
+_MCP_RETRY_BASE_DELAY = 2.0
 
 
-async def _get_tools() -> dict:
-    """Return cached tool map, initialising on first call."""
-    global _tool_map
-    if not _tool_map:
-        client    = MultiServerMCPClient(MCP_CONFIG)
-        tools     = await client.get_tools(server_name="writers_room")
-        _tool_map = {t.name: t for t in tools}
-    return _tool_map
+async def _call_tool(tool_name: str, **kwargs) -> str:
+    """
+    Call a named MCP tool, returning a plain string.
+
+    Creates a fresh MultiServerMCPClient per call so TCP connections are not
+    held open between tool invocations (prevents WinError 10054 on Windows).
+    Note: langchain-mcp-adapters >=0.1.0 does NOT support async-with on the
+    client directly; use client.get_tools() without a context manager.
+    Wraps the network request in retry logic with exponential backoff for
+    transient connection resets.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, _MCP_RETRIES + 1):
+        try:
+            # Fresh client per attempt — intentionally NOT cached.
+            client   = MultiServerMCPClient(MCP_CONFIG)
+            tools    = await client.get_tools(server_name="writers_room")
+            tool_map = {t.name: t for t in tools}
+
+            if tool_name not in tool_map:
+                raise ValueError(
+                    f"Tool '{tool_name}' not found in MCP registry. "
+                    f"Available: {list(tool_map.keys())}"
+                )
+
+            result = await tool_map[tool_name].ainvoke(kwargs)
+            return _extract_text(result)
+
+        except (ConnectionResetError, ConnectionAbortedError) as exc:
+            last_exc = exc
+            delay = _MCP_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+            print(
+                f"[MCP] ConnectionReset on '{tool_name}' "
+                f"(attempt {attempt}/{_MCP_RETRIES}): {exc}. "
+                f"Retrying in {delay:.1f}s..."
+            )
+            await asyncio.sleep(delay)
+
+        except Exception as exc:
+            # Catch httpx RemoteProtocolError which wraps WinError 10054
+            exc_str = str(exc)
+            if "10054" in exc_str or "RemoteProtocol" in type(exc).__name__:
+                last_exc = exc
+                delay = _MCP_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                print(
+                    f"[MCP] RemoteProtocolError on '{tool_name}' "
+                    f"(attempt {attempt}/{_MCP_RETRIES}): {exc}. "
+                    f"Retrying in {delay:.1f}s..."
+                )
+                await asyncio.sleep(delay)
+            else:
+                raise  # Non-transient errors propagate immediately.
+
+    raise RuntimeError(
+        f"MCP tool '{tool_name}' failed after {_MCP_RETRIES} attempts. "
+        f"Last error: {last_exc}"
+    ) from last_exc
 
 
 def _extract_text(result) -> str:
@@ -70,22 +121,8 @@ def _extract_text(result) -> str:
     # Fallback — serialise whatever we got.
     return json.dumps(result)
 
-
-async def _call_tool(tool_name: str, **kwargs) -> str:
-    """Call a named MCP tool and always return a plain string."""
-    tmap = await _get_tools()
-
-    if tool_name not in tmap:
-        raise ValueError(
-            f"Tool '{tool_name}' not found in MCP registry. "
-            f"Available: {list(tmap.keys())}"
-        )
-
-    result = await tmap[tool_name].ainvoke(kwargs)
-    return _extract_text(result)
-
-
 # ─── Internal helpers ─────────────────────────────────────────────────────────
+
 
 def _safe_parse(text: str):
     """

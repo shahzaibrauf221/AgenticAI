@@ -540,19 +540,26 @@ async function revertEditVersion() {
   }
 }
 
+function cacheBustMediaUrl(u) {
+  if (!u) return u;
+  const sep = u.includes("?") ? "&" : "?";
+  return u + sep + "_cb=" + Date.now();
+}
+
 function renderOutputs(data) {
   // Final video
   const finalArea = $("finalVideoArea");
   const dlBtn     = $("btnDownload");
   if (data.final_video) {
+    const fv = cacheBustMediaUrl(data.final_video);
     finalArea.innerHTML = `
       <div class="video-player">
-        <video src="${data.final_video}" controls preload="metadata"></video>
+        <video src="${fv}" controls preload="metadata"></video>
       </div>
       <p class="small" style="margin-top:6px;">${data.final_video}</p>
     `;
     dlBtn.disabled = false;
-    dlBtn.onclick  = () => window.open(data.final_video, "_blank");
+    dlBtn.onclick  = () => window.open(fv, "_blank");
   } else {
     finalArea.className = "empty";
     finalArea.textContent = "No final video yet — run the pipeline.";
@@ -605,7 +612,7 @@ function renderOutputs(data) {
   $("sceneClips").innerHTML = clips.length
     ? clips.map(c => `
         <div class="scene-card">
-          <video src="${c.url}" controls style="width:100%; border-radius:6px; background:#000;"></video>
+          <video src="${cacheBustMediaUrl(c.url)}" controls style="width:100%; border-radius:6px; background:#000;"></video>
           <p style="margin-top:6px;">${escapeHtml(c.name)} — ${c.size_mb} MB</p>
         </div>
       `).join("")

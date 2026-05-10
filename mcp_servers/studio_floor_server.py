@@ -610,6 +610,13 @@ def query_stock_footage(
                     shot_kw["duration_s"] = max(1.0, float(raw.strip()))
                 except ValueError:
                     pass
+            # I2V forces the same reference image for every scene unless you vary URLs.
+            # Opt-in only: set BYTEDANCE_I2V_ENABLED=1 and BYTEDANCE_I2V_IMAGE_URL=...
+            i2v_url = (os.environ.get("BYTEDANCE_I2V_IMAGE_URL", "") or "").strip() or None
+            i2v_on = (os.environ.get("BYTEDANCE_I2V_ENABLED", "") or "").strip().lower() in (
+                "1", "true", "yes", "on",
+            )
+            image_url = i2v_url if (i2v_on and i2v_url) else None
             local_file = client.generate_video_and_wait(
                 prompt=prompt,
                 output_path=out_path,
@@ -617,7 +624,7 @@ def query_stock_footage(
                 width=width,
                 height=height,
                 seed=seed,
-                image_url=(os.environ.get("BYTEDANCE_I2V_IMAGE_URL", "").strip() or None),
+                image_url=image_url,
                 **shot_kw,
             )
             local_path = Path(local_file)

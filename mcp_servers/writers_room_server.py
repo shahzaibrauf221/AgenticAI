@@ -197,16 +197,45 @@ Use exactly this structure:
 }}
 Fill in ALL fields with real content. Do not use placeholder words like 'string' or 'name'.
 IMPORTANT RULES for scene_visual_cue:
-1. NATURAL LANGUAGE STYLE (MANDATORY): Write `scene_visual_cue` as 1-2 flowing cinematic sentences, not comma-separated tags or keyword lists.
-2. GENDER & BUILD (MANDATORY): Every character mention MUST include explicit gender, approximate age, and body type/build.
-3. SETTING CONTINUITY (MANDATORY): EVERY `scene_visual_cue` MUST explicitly restate the environment/background, even when unchanged.
-4. CINEMATIC CAMERA DETAIL (MANDATORY): Include framing or movement details (example: wide shot, tracking shot, slow push-in, over-shoulder).
-5. DIALOGUE LENGTH (MANDATORY): Every scene MUST include **2–3 dialogue entries**. Single-line scenes are forbidden. Each "line" is ONE natural conversational sentence capped at ~22 words (no monologues; keep punchy exchanges).
-6. STORY PROGRESSION (MANDATORY): Adjacent scenes must show clear progression (new beat, action change, or reveal), not rephrased duplicates.
-7. OUTPUT SAFETY: Keep `scene_visual_cue` physically descriptive only. No metaphors, internal thoughts, or abstract themes.
-8. QUALITY CHECK BEFORE RETURN: If any scene violates rules 1-7, rewrite it before returning JSON."""
+1. KEYWORD FORMAT (MANDATORY — VIDEO GENERATOR CLIP LIMIT): Write `scene_visual_cue` as COMPACT, COMMA-SEPARATED KEYWORDS ONLY. NO full sentences. NO flowery prose. NO abstract metaphors. The field must read like a Stable Diffusion prompt, e.g.: "neon enigma, sci-fi mystery, rainy alleyway, woman detective 30s, wide shot, night, moody lighting". STRICT HARD LIMIT: 40 words maximum. Violating this limit WILL cause the video generation pipeline to fail.
+2. REQUIRED KEYWORD CATEGORIES (include all of these): [title slug], [genre], [environment/setting], [character: gender+age+build], [camera angle], [time of day], [lighting mood].
+3. CHARACTER SPECIFICITY (MANDATORY): Every character mentioned MUST include gender, approximate age, and build — all as keywords (e.g., "female detective 30s slim", "male villain 50s stocky").
+4. CAMERA ANGLE (MANDATORY): Always include one camera angle keyword (wide shot, medium shot, close-up, over-shoulder, tracking shot, low angle, bird's eye).
+5. DIALOGUE LENGTH (MANDATORY): Every scene MUST include **2–3 dialogue entries**. Each "line" is ONE natural conversational sentence capped at ~22 words.
+6. STORY PROGRESSION (MANDATORY): Adjacent scenes must show clear progression — new beat, action change, or reveal.
+7. QUALITY CHECK BEFORE RETURN: Verify `scene_visual_cue` is under 40 words and contains only comma-separated keywords. If any scene violates rules 1-6, rewrite it before returning JSON."""
 
-    return _llm(system, prompt)
+    raw = _llm(system, prompt)
+
+    # ── Server-side CLIP guard ─────────────────────────────────────────────────
+    # Even if the LLM ignores the system prompt and generates flowery prose,
+    # we truncate scene_visual_cue to ≤40 words before it can reach the video
+    # generator and exceed the 77-token CLIP limit.
+    try:
+        import re as _re
+        parsed = json.loads(_unwrap_llm_output(raw))
+        mutated = False
+        for scene in parsed.get("scenes", []):
+            cue = scene.get("scene_visual_cue", "")
+            if not cue:
+                continue
+            words = cue.split()
+            if len(words) > 40:
+                # Convert prose to compact keyword form: take first 40 words,
+                # strip trailing punctuation, and separate by commas.
+                keywords = [w.rstrip(".,;:!?") for w in words[:40]]
+                scene["scene_visual_cue"] = ", ".join(kw for kw in keywords if kw)
+                mutated = True
+                print(
+                    f"[ScriptWriter Guard] scene_id={scene.get('scene_id')} "
+                    f"visual_cue truncated from {len(words)} to ≤40 words."
+                )
+        if mutated:
+            raw = json.dumps(parsed)
+    except Exception:
+        pass  # If the output isn't JSON yet, let the orchestrator handle it.
+
+    return raw
 
 
 @mcp.tool()
