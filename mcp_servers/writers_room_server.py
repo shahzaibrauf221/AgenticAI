@@ -199,12 +199,19 @@ Use exactly this structure:
   ]
 }}
 Fill in ALL fields with real content. Do not use placeholder words like 'string' or 'name'.
+HONOR THE USER'S CAST AND STYLE: If the idea calls for animals, anthropomorphic
+characters, robots, monsters, or a cartoon/animated style (e.g. "a cat named Tom
+chasing a mouse named Jerry"), KEEP THAT. Do NOT silently replace non-human
+characters with humans, and do NOT convert an animated idea into live action. Set
+`genre` to reflect the style (e.g. "animated comedy", "2D cartoon adventure") and
+keep every `scene_visual_cue` consistent with it (e.g. include "2D cartoon style"
+or "3D animated" plus the actual species: "orange tabby cat", "small grey mouse").
 IMPORTANT RULES for scene_visual_cue:
-1. KEYWORD FORMAT (MANDATORY — VIDEO GENERATOR CLIP LIMIT): Write `scene_visual_cue` as COMPACT, COMMA-SEPARATED KEYWORDS ONLY. NO full sentences. NO flowery prose. NO abstract metaphors. The field must read like a Stable Diffusion prompt, e.g.: "neon enigma, sci-fi mystery, rainy alleyway, woman detective 30s, wide shot, night, moody lighting". STRICT HARD LIMIT: 40 words maximum. Violating this limit WILL cause the video generation pipeline to fail.
-2. REQUIRED KEYWORD CATEGORIES (include all of these): [title slug], [genre], [environment/setting], [character: gender+age+build], [camera angle], [time of day], [lighting mood].
-3. CHARACTER SPECIFICITY (MANDATORY): Every character mentioned MUST include gender, approximate age, and build — all as keywords (e.g., "female detective 30s slim", "male villain 50s stocky").
+1. KEYWORD FORMAT (MANDATORY — VIDEO GENERATOR CLIP LIMIT): Write `scene_visual_cue` as COMPACT, COMMA-SEPARATED KEYWORDS ONLY. NO full sentences. NO flowery prose. NO abstract metaphors. The field must read like a Stable Diffusion prompt, e.g.: "neon enigma, sci-fi mystery, rainy alleyway, woman detective 30s, wide shot, night, moody lighting" — or for animation: "tom and jerry chase, 2D cartoon style, orange cat, small grey mouse, suburban kitchen, wide shot, day, bright colors". STRICT HARD LIMIT: 40 words maximum. Violating this limit WILL cause the video generation pipeline to fail.
+2. REQUIRED KEYWORD CATEGORIES (include all of these): [title slug], [genre], [animation/render style if not live-action: "2D cartoon"/"3D animated"/etc.], [environment/setting], [character: see rule 3], [camera angle], [time of day], [lighting mood].
+3. CHARACTER SPECIFICITY (MANDATORY): Describe every character as keywords. For HUMAN characters include gender, approximate age, and build (e.g., "female detective 30s slim", "male villain 50s stocky"). For NON-HUMAN characters give the species/type and key visual traits instead (e.g., "orange tabby cat big eyes", "small grey mouse red bowtie", "rusty boxy robot"). Never describe an animal as if it were a person.
 4. CAMERA ANGLE (MANDATORY): Always include one camera angle keyword (wide shot, medium shot, close-up, over-shoulder, tracking shot, low angle, bird's eye).
-5. DIALOGUE LENGTH (MANDATORY): Every scene MUST include **2–3 dialogue entries**. Each "line" is ONE natural conversational sentence capped at ~22 words.
+5. DIALOGUE LENGTH (MANDATORY): Every scene MUST include **2–3 dialogue entries**. Each "line" is ONE natural conversational sentence capped at ~22 words. (For silent-cartoon ideas, dialogue may be short reaction lines / onomatopoeia, but still provide 2–3 entries.)
 6. STORY PROGRESSION (MANDATORY): Adjacent scenes must show clear progression — new beat, action change, or reveal.
 7. QUALITY CHECK BEFORE RETURN: Verify `scene_visual_cue` is under 40 words and contains only comma-separated keywords. If any scene violates rules 1-6, rewrite it before returning JSON."""
 
@@ -358,7 +365,7 @@ def extract_characters(script_json: str) -> str:
     Extract and formalize character identities from a script JSON.
     Returns a JSON array of character profiles.
     """
-    system = """You are a character designer for films.
+    system = """You are a character designer for films and animation.
 Given a screenplay JSON, extract every named character and build a profile for each.
 Return ONLY a valid JSON array with NO markdown, NO code fences, NO explanation.
 Use exactly this structure:
@@ -366,16 +373,20 @@ Use exactly this structure:
   {
     "character_id": "char_001",
     "name": "actual character name",
-    "age_range": "e.g. 30s",
+    "age_range": "e.g. 30s — or 'n/a' for non-human characters",
     "gender": "male or female or other",
+    "species": "human, or the actual species/type — e.g. 'cat', 'mouse', 'robot', 'dragon'",
     "personality_traits": ["trait1", "trait2", "trait3"],
     "appearance": "detailed physical description suitable for image generation",
-    "costume": "what they wear",
-    "reference_style": "photorealistic",
+    "costume": "what they wear (or 'none' / a collar / a bowtie etc. for animals)",
+    "reference_style": "photorealistic OR animated — match the screenplay's style",
     "scenes_appeared": [1, 2, 3]
   }
 ]
-Fill ALL fields with real content based on the script. Do not use placeholder words."""
+Rules:
+- If the screenplay is a cartoon / animated piece, set "reference_style" to "animated"; otherwise "photorealistic".
+- For NON-HUMAN characters (animals, robots, creatures), set "species" accordingly, describe them as that species in "appearance" (NEVER as a human), use "n/a" for age_range if it doesn't apply, and "other" for gender if unknown.
+- Fill ALL fields with real content based on the script. Do not use placeholder words."""
 
     clean = _unwrap_llm_output(script_json)
     return _llm(system, f"Extract characters from this screenplay:\n{clean}")
