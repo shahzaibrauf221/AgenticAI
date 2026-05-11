@@ -1,3 +1,4 @@
+import logging
 import os
 import re
 import time
@@ -6,6 +7,19 @@ from pathlib import Path
 from typing import Any
 
 import requests
+
+logger = logging.getLogger(__name__)
+
+# Transient network failures we want to retry the MP4 download on. The TOS bucket
+# raises these under load: requests wraps urllib3's ReadTimeoutError as either
+# requests.exceptions.ReadTimeout or requests.exceptions.ConnectionError, and a
+# stream that dies mid-body surfaces as ChunkedEncodingError.
+_RETRYABLE_DOWNLOAD_ERRORS: tuple[type[Exception], ...] = (
+    requests.exceptions.ReadTimeout,
+    requests.exceptions.ConnectionError,
+    requests.exceptions.ChunkedEncodingError,
+    ConnectionError,
+)
 
 
 class ByteDanceVideoClientError(RuntimeError):
@@ -20,9 +34,25 @@ class ByteDanceVideoClientConfig:
     submit_path: str = "/contents/generations/tasks"
     task_path_template: str = "/contents/generations/tasks/{task_id}"
     timeout_s: int = 60
+    # Connect timeout for submit/poll calls — kept short so an unreachable ByteDance
+    # API host (ark.*.bytepluses.com flaps from some regions) fails fast and the
+    # whole-task retry kicks in, instead of burning the full read timeout per attempt.
+    api_connect_timeout_s: float = 10.0
     poll_timeout_s: int = 900
     poll_backoff_start_s: float = 1.0
     poll_backoff_max_s: float = 15.0
+    # MP4 download tuning — parallel scenes saturate the link and trip the default
+    # requests read timeout against the Volcengine TOS bucket, so be generous here.
+    download_connect_timeout_s: float = 10.0
+    download_read_timeout_s: float = 120.0
+    download_chunk_size: int = 1024 * 1024
+    download_max_attempts: int = 4
+    download_retry_wait_s: float = 5.0
+    # Whole-task retries — Seedance (esp. the *-fast tier) intermittently returns
+    # status=FAILED, gets rate-limited, or 5xx's. Retry the full submit→poll→download
+    # cycle before the caller falls back to the local placeholder renderer.
+    task_max_attempts: int = 3
+    task_retry_wait_s: float = 8.0
     # Seedance text line suffixes (env overridable).
     # Empty video_resolution omits `--resolution …` (Seedance 1.5 examples use duration + camerafixed only).
     video_resolution: str = ""
@@ -84,9 +114,17 @@ class ByteDanceVideoClient:
                 "BYTEDANCE_TASK_PATH_TEMPLATE", "/contents/generations/tasks/{task_id}"
             ),
             timeout_s=int(os.getenv("BYTEDANCE_HTTP_TIMEOUT_S", "60")),
+            api_connect_timeout_s=float(os.getenv("BYTEDANCE_API_CONNECT_TIMEOUT_S", "10")),
             poll_timeout_s=int(os.getenv("BYTEDANCE_POLL_TIMEOUT_S", "900")),
             poll_backoff_start_s=float(os.getenv("BYTEDANCE_POLL_BACKOFF_START_S", "1.0")),
             poll_backoff_max_s=float(os.getenv("BYTEDANCE_POLL_BACKOFF_MAX_S", "15.0")),
+            download_connect_timeout_s=float(os.getenv("BYTEDANCE_DOWNLOAD_CONNECT_TIMEOUT_S", "10")),
+            download_read_timeout_s=float(os.getenv("BYTEDANCE_DOWNLOAD_READ_TIMEOUT_S", "120")),
+            download_chunk_size=int(os.getenv("BYTEDANCE_DOWNLOAD_CHUNK_SIZE", str(1024 * 1024))),
+            download_max_attempts=int(os.getenv("BYTEDANCE_DOWNLOAD_MAX_ATTEMPTS", "4")),
+            download_retry_wait_s=float(os.getenv("BYTEDANCE_DOWNLOAD_RETRY_WAIT_S", "5")),
+            task_max_attempts=int(os.getenv("BYTEDANCE_TASK_MAX_ATTEMPTS", "3")),
+            task_retry_wait_s=float(os.getenv("BYTEDANCE_TASK_RETRY_WAIT_S", "8")),
             video_resolution=os.getenv("BYTEDANCE_VIDEO_RESOLUTION", "").strip(),
             video_duration_seconds=duration_int,
             camera_fixed=os.getenv("BYTEDANCE_CAMERA_FIXED", "false").strip().lower(),
@@ -226,7 +264,7 @@ class ByteDanceVideoClient:
             url,
             headers=self._headers(),
             json=payload,
-            timeout=self.config.timeout_s,
+            timeout=(self.config.api_connect_timeout_s, self.config.timeout_s),
         )
         try:
             resp.raise_for_status()
@@ -260,7 +298,11 @@ class ByteDanceVideoClient:
         sleep_s = max(0.1, self.config.poll_backoff_start_s)
 
         while time.time() < deadline:
-            resp = requests.get(status_url, headers=self._headers(), timeout=self.config.timeout_s)
+            resp = requests.get(
+                status_url,
+                headers=self._headers(),
+                timeout=(self.config.api_connect_timeout_s, self.config.timeout_s),
+            )
             try:
                 resp.raise_for_status()
             except requests.HTTPError as e:
@@ -319,25 +361,69 @@ class ByteDanceVideoClient:
             f"Timed out waiting for task {task_id} after {self.config.poll_timeout_s}s"
         )
 
-    def download_video(self, video_url: str, output_path: str | Path) -> str:
-        out = Path(output_path)
-        out.parent.mkdir(parents=True, exist_ok=True)
+    def _download_video_once(self, video_url: str, out: Path) -> None:
+        """Single streamed download attempt — writes the MP4 to `out` in chunks.
 
-        with requests.get(video_url, stream=True, timeout=self.config.timeout_s) as resp:
+        `out` is opened with "wb" so each attempt starts from a clean file; we never
+        buffer the whole MP4 in RAM (`stream=True` + `iter_content`). The timeout is a
+        (connect, read) tuple so a slow-but-alive TOS connection under parallel load
+        gets the full read window instead of the short default.
+        """
+        timeout = (self.config.download_connect_timeout_s, self.config.download_read_timeout_s)
+        tmp = out.with_suffix(out.suffix + ".part")
+        with requests.get(video_url, stream=True, timeout=timeout) as resp:
             try:
                 resp.raise_for_status()
             except requests.HTTPError as e:
+                # Non-transient (4xx/5xx) — surface immediately, do not retry.
                 raise ByteDanceVideoClientError(
                     f"Video download failed ({resp.status_code}): {video_url}"
                 ) from e
-            with out.open("wb") as f:
-                for chunk in resp.iter_content(chunk_size=1024 * 1024):
+            with tmp.open("wb") as f:
+                for chunk in resp.iter_content(chunk_size=self.config.download_chunk_size):
                     if chunk:
                         f.write(chunk)
+        if not tmp.exists() or tmp.stat().st_size == 0:
+            tmp.unlink(missing_ok=True)
+            raise requests.exceptions.ChunkedEncodingError(
+                f"Downloaded file is empty (truncated stream): {video_url}"
+            )
+        os.replace(tmp, out)
 
-        if not out.exists() or out.stat().st_size == 0:
-            raise ByteDanceVideoClientError(f"Downloaded file is empty at {out}")
-        return str(out.resolve())
+    def download_video(self, video_url: str, output_path: str | Path) -> str:
+        """Download the final MP4 with a generous read timeout and retries.
+
+        Parallel LangGraph scenes hammer the Volcengine TOS bucket simultaneously, so
+        the default requests timeout trips with "Read timed out". We retry transient
+        network failures (ReadTimeout / ConnectionError / mid-stream truncation) up to
+        `download_max_attempts` times, waiting `download_retry_wait_s` between tries.
+        """
+        out = Path(output_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+
+        max_attempts = max(1, self.config.download_max_attempts)
+        last_err: Exception | None = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                self._download_video_once(video_url, out)
+                if not out.exists() or out.stat().st_size == 0:
+                    raise ByteDanceVideoClientError(f"Downloaded file is empty at {out}")
+                return str(out.resolve())
+            except _RETRYABLE_DOWNLOAD_ERRORS as e:
+                last_err = e
+                if attempt >= max_attempts:
+                    break
+                wait_s = self.config.download_retry_wait_s
+                logger.warning(
+                    "MP4 download attempt %d/%d failed (%s: %s) — retrying in %.1fs: %s",
+                    attempt, max_attempts, type(e).__name__, e, wait_s, video_url,
+                )
+                time.sleep(wait_s)
+
+        raise ByteDanceVideoClientError(
+            f"Video download failed after {max_attempts} attempts for {video_url}: "
+            f"{type(last_err).__name__ if last_err else 'unknown'}: {last_err}"
+        ) from last_err
 
     def generate_video_and_wait(
         self,
@@ -350,6 +436,14 @@ class ByteDanceVideoClient:
         duration_s: float | None = None,
         image_url: str | None = None,
     ) -> str:
+        """Submit → poll → download one scene, retrying the whole cycle on failure.
+
+        Seedance (especially the *-fast tier) intermittently fails a task (status=FAILED),
+        gets rate-limited, or 5xx's mid-poll. Rather than handing the caller a placeholder
+        on the first hiccup, retry up to `task_max_attempts` times with linear backoff;
+        from attempt 2 on we also try the simplified prompt, which clears most content
+        rejects. Raises ByteDanceVideoClientError only after all attempts are exhausted.
+        """
         def _attempt(p: str) -> str:
             task_id = self.submit_video_task(
                 prompt=p,
@@ -363,12 +457,32 @@ class ByteDanceVideoClient:
             video_url = self.poll_task_until_success(task_id)
             return self.download_video(video_url, output_path)
 
-        try:
-            return _attempt(prompt)
-        except ByteDanceVideoClientError as e:
-            if not self._is_invalid_content_text_error(str(e)):
-                raise
-            simplified = self._sanitize_prompt_for_retry(prompt)
-            if simplified.strip() == (prompt or "").strip():
-                raise
-            return _attempt(simplified)
+        original = (prompt or "").strip()
+        simplified = self._sanitize_prompt_for_retry(prompt)
+        max_attempts = max(1, self.config.task_max_attempts)
+        last_err: Exception | None = None
+
+        for attempt in range(1, max_attempts + 1):
+            # Attempt 1: full prompt. Later attempts prefer the simplified prompt (if it
+            # differs) — most hard rejects are content-text related; this also dodges some
+            # transient moderation flakiness on borderline prose.
+            p = original if (attempt == 1 or simplified == original) else simplified
+            try:
+                return _attempt(p)
+            except (ByteDanceVideoClientError,
+                    requests.exceptions.RequestException,
+                    ConnectionError) as e:
+                last_err = e
+                if attempt >= max_attempts:
+                    break
+                wait_s = self.config.task_retry_wait_s * attempt  # linear backoff
+                logger.warning(
+                    "ByteDance task attempt %d/%d failed for scene %s (%s: %s) — retrying in %.0fs",
+                    attempt, max_attempts, scene_id, type(e).__name__, e, wait_s,
+                )
+                time.sleep(wait_s)
+
+        raise ByteDanceVideoClientError(
+            f"ByteDance generation failed for scene {scene_id} after {max_attempts} attempt(s): "
+            f"{type(last_err).__name__ if last_err else 'unknown'}: {last_err}"
+        ) from last_err

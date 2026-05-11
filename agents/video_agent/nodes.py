@@ -42,7 +42,14 @@ MCP_CONFIG = {
 }
 
 import httpx as _httpx
-_DEFAULT_TIMEOUT = _httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=30.0)
+# query_stock_footage blocks the server for the whole ByteDance lifecycle: Seedance
+# generation (poll loop, up to BYTEDANCE_POLL_TIMEOUT_S=900s) + the MP4 download
+# (up to BYTEDANCE_DOWNLOAD_MAX_ATTEMPTS retries against a flaky TOS bucket). A single
+# scene can legitimately take 15+ min, so the MCP client's read timeout MUST exceed
+# that or the agent disconnects mid-call and the server's result is orphaned
+# (ConnectionResetError WinError 10054). Override with PHASE3_MCP_READ_TIMEOUT_S.
+_MCP_READ_TIMEOUT_S = float(os.getenv("PHASE3_MCP_READ_TIMEOUT_S", "1800"))
+_DEFAULT_TIMEOUT = _httpx.Timeout(connect=10.0, read=_MCP_READ_TIMEOUT_S, write=60.0, pool=30.0)
 
 
 def _custom_httpx_factory(headers=None, timeout=None, auth=None):
@@ -947,20 +954,29 @@ async def video_gen_node(state: AgentState) -> dict:
           f"{prompt_text[:240]}{'…' if len(prompt_text) > 240 else ''}")
 
     seed = state.get("global_seed", -1)
-    raw = await _call_tool(
-        "query_stock_footage",
-        scene_id=sid,
-        prompt=prompt_text,
-        num_frames=16,
-        width=512,
-        height=512,
-        seed=seed if isinstance(seed, int) else -1,
-        negative_prompt=neg_prompt,
-        denoising_strength=0.0,
-        init_image_b64="",
-    )
-    base = _safe_parse(raw)
-    raw_video = base.get("file", "")
+    # A slow/flaky ByteDance + TOS download can blow past even the generous MCP read
+    # timeout (or the server can crash mid-response). Don't let one scene kill the
+    # whole graph — degrade to "no base video" and let lip_sync_node build the
+    # background-image fallback for this scene.
+    raw_video = ""
+    try:
+        raw = await _call_tool(
+            "query_stock_footage",
+            scene_id=sid,
+            prompt=prompt_text,
+            num_frames=16,
+            width=512,
+            height=512,
+            seed=seed if isinstance(seed, int) else -1,
+            negative_prompt=neg_prompt,
+            denoising_strength=0.0,
+            init_image_b64="",
+        )
+        base = _safe_parse(raw)
+        raw_video = base.get("file", "") or ""
+    except Exception as e:
+        print(f"  [Video Gen    | scene {sid}] ✗ query_stock_footage failed "
+              f"({type(e).__name__}: {e}) — continuing without a base video for this scene")
 
     # Final trim/fit to exact target audio duration.
     base_video = _sync_clip_duration(raw_video, duration) if raw_video else raw_video

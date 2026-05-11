@@ -710,7 +710,11 @@ def _render_scene_video_pil_clean(
     n_frames = max(1, int(duration_s * fps))
     scene_frames_dir = FRAMES_DIR / f"scene_{scene_id:02d}"
     scene_frames_dir.mkdir(parents=True, exist_ok=True)
-    bg_color = _deterministic_color(prompt[:20] if prompt else f"scene_{scene_id}")
+    # Fixed neutral slate — this is a "video generation failed, placeholder" card, not art.
+    # (Old behaviour hashed the prompt into a random colour, which is why fallbacks looked
+    #  like flat magenta clips in the final cut.)
+    bg_color = (26, 30, 36)
+    bar_color = (40, 46, 54)
 
     try:
         font = ImageFont.load_default()
@@ -720,17 +724,13 @@ def _render_scene_video_pil_clean(
     for i in range(n_frames):
         img = Image.new("RGBA", (W, H), bg_color + (255,))
         draw = ImageDraw.Draw(img)
-        pulse = int(30 * math.sin(2 * math.pi * i / max(1, n_frames)))
-        overlay_color = (
-            max(0, min(255, bg_color[0] + pulse)),
-            max(0, min(255, bg_color[1] + pulse)),
-            max(0, min(255, bg_color[2] + pulse)),
-        )
-        draw.rectangle([(0, H - 80), (W, H)], fill=overlay_color + (255,))
-        draw.text((20, 20), f"SCENE {scene_id}", fill=(255, 255, 255), font=font)
-        draw.text((20, 50), f"PROMPT: {prompt[:50]}", fill=(230, 230, 230), font=font)
+        draw.rectangle([(0, 0), (W, 70)], fill=bar_color + (255,))
+        draw.rectangle([(0, H - 70), (W, H)], fill=bar_color + (255,))
+        draw.text((20, 14), f"SCENE {scene_id} — PLACEHOLDER (video generation failed)",
+                  fill=(235, 200, 90), font=font)
+        draw.text((20, 40), f"PROMPT: {prompt[:60]}", fill=(210, 210, 210), font=font)
         # No character portraits, no ellipses, no character name labels
-        draw.text((20, H - 30), f"frame {i+1}/{n_frames}", fill=(200, 200, 200), font=font)
+        draw.text((20, H - 28), f"frame {i+1}/{n_frames}", fill=(160, 160, 160), font=font)
         img.convert("RGB").save(scene_frames_dir / f"frame_{i:04d}.png")
 
     if _has_ffmpeg():
@@ -882,14 +882,15 @@ def query_stock_image(
     out_path = FRAMES_DIR / f"scene_{scene_id:02d}_bg_image.png"
     W, H = 1920, 1080
 
-    seed = location or visual_cue or f"scene_{scene_id}"
-    bg_color = _deterministic_color(seed[:20])
+    # Fixed neutral slate (no prompt-hashed random colour — keeps fallback frames
+    # from looking like flat magenta/lime cards in the final cut).
+    bg_color = (26, 30, 36)
 
     img  = Image.new("RGB", (W, H), bg_color)
     draw = ImageDraw.Draw(img)
 
     # Subtle gradient-feel: darker bottom bar
-    darker = tuple(max(0, c - 60) for c in bg_color)
+    darker = tuple(max(0, c - 12) for c in bg_color)
     draw.rectangle([(0, H - 200), (W, H)], fill=darker)
 
     try:
