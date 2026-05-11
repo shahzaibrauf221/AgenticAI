@@ -14,7 +14,9 @@ def route_edit_execution(state: EditAgentState) -> EditAgentState:
     rerun_from = "phase3"
     rerun_pipeline = False
 
-    if target == "script":
+    if intent == "clarify_request":
+        rerun_pipeline = False
+    elif target == "script":
         rerun_from = "phase1"
         rerun_pipeline = True
     elif target == "audio":
@@ -22,7 +24,9 @@ def route_edit_execution(state: EditAgentState) -> EditAgentState:
         rerun_pipeline = True
     elif target in ("video", "video_frame"):
         rerun_from = "phase3"
-        rerun_pipeline = intent in ("recompose_video", "add_subtitle", "remove_subtitle")
+        # recompose_video is now self-contained (re-stitches existing per-scene
+        # clips, picking the newest variant) — no full phase-3 rerun needed.
+        rerun_pipeline = intent in ("add_subtitle", "remove_subtitle")
 
     return {
         **state,

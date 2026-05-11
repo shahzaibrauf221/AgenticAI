@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ffprobe -v error -show_format -show_streams \"D:/Ali/VS_code_ptoject/AGENTICAI/expected_output/WhatsApp Video 2026-05-08 at 10.00.39 PM.mp4\")",
+      "Bash(git -C D:/Ali/VS_code_ptoject/AGENTICAI log --all --oneline -- \"backend/routes/edit.py\")",
+      "Bash(git *)"
+    ]
+  }
+}

@@ -105,6 +105,19 @@ def _has_ffmpeg() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
+def _ffprobe_duration(path) -> float:
+    """Return audio/video duration in seconds via ffprobe; 0.0 on failure."""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            capture_output=True, text=True, timeout=10,
+        )
+        return float(r.stdout.strip() or 0.0)
+    except Exception:
+        return 0.0
+
+
 def _safe_name(s: str) -> str:
     return "".join(c if c.isalnum() or c in "-_" else "_" for c in s).lower()
 
@@ -225,6 +238,143 @@ _EMOTION_SLOW = {"sad": True, "anxious": False, "calm": False, "warm": False,
 _EMOTION_TEMPO = {"sad": 0.92, "anxious": 1.10, "calm": 0.97, "warm": 1.00,
                   "confident": 1.05, "neutral": 1.00}
 
+# ── edge-tts: gender-aware Neural voices per accent ──────────────────────────
+# Multiple distinct voices per (accent, gender) so same-gender characters don't
+# sound identical. Round-robin per character_name hash. All voice IDs verified
+# against `edge_tts.list_voices()` — deprecated names (Davis, Tony, en-AU-William)
+# removed.
+_EDGE_VOICE_MAP: dict[tuple[str, str], list[str]] = {
+    ("american",  "male"):   ["en-US-GuyNeural", "en-US-AndrewNeural",
+                              "en-US-BrianNeural", "en-US-ChristopherNeural",
+                              "en-US-EricNeural", "en-US-RogerNeural"],
+    ("american",  "female"): ["en-US-JennyNeural", "en-US-AriaNeural",
+                              "en-US-AvaNeural", "en-US-EmmaNeural",
+                              "en-US-MichelleNeural"],
+    ("british",   "male"):   ["en-GB-RyanNeural", "en-GB-ThomasNeural"],
+    ("british",   "female"): ["en-GB-SoniaNeural", "en-GB-LibbyNeural"],
+    ("australian","male"):   ["en-US-GuyNeural"],     # MS removed en-AU male voices
+    ("australian","female"): ["en-AU-NatashaNeural"],
+    ("indian",    "male"):   ["en-IN-PrabhatNeural"],
+    ("indian",    "female"): ["en-IN-NeerjaNeural"],
+    ("canadian",  "male"):   ["en-CA-LiamNeural"],
+    ("canadian",  "female"): ["en-CA-ClaraNeural"],
+    ("irish",     "male"):   ["en-IE-ConnorNeural"],
+    ("irish",     "female"): ["en-IE-EmilyNeural"],
+}
+
+# tld → accent (inverse of audio_agent's accent_to_tld map)
+_TLD_TO_ACCENT = {
+    "com": "american", "co.uk": "british", "com.au": "australian",
+    "co.in": "indian", "ca": "canadian", "ie": "irish",
+}
+
+# emotion → (rate%, pitch Hz) for edge-tts prosody.
+# edge-tts requires signed values — "+0%" / "+0Hz", never bare "0%".
+_EMOTION_PROSODY = {
+    "sad":       ("-10%", "-30Hz"),
+    "anxious":   ("+12%", "+20Hz"),
+    "calm":      ("-3%",  "-5Hz"),
+    "warm":      ("+0%",  "+5Hz"),
+    "confident": ("+5%",  "+0Hz"),
+    "neutral":   ("+0%",  "+0Hz"),
+}
+
+
+def _resolve_accent(accent: str, tld: str) -> str:
+    a = (accent or "").strip().lower()
+    if a in {"american", "british", "australian", "indian", "canadian", "irish"}:
+        return a
+    return _TLD_TO_ACCENT.get((tld or "").lower(), "american")
+
+
+def _normalize_gender(gender: str) -> str:
+    g = (gender or "").strip().lower()
+    if g in {"male", "m", "man", "boy"}:
+        return "male"
+    if g in {"female", "f", "woman", "girl"}:
+        return "female"
+    return "female"  # default — better than silently shipping a male voice for unknowns
+
+
+def _pick_edge_voice(accent: str, gender: str, character_name: str) -> str:
+    accent = _resolve_accent(accent, "com") if accent else "american"
+    gender = _normalize_gender(gender)
+    voices = _EDGE_VOICE_MAP.get((accent, gender))
+    if not voices:
+        # accent unsupported — fall back to American of the requested gender
+        voices = _EDGE_VOICE_MAP.get(("american", gender), ["en-US-JennyNeural"])
+    idx = sum(ord(c) for c in (character_name or "")) % len(voices)
+    return voices[idx]
+
+
+def _tts_edge(
+    text: str,
+    path: Path,
+    accent: str,
+    gender: str,
+    emotion: str,
+    character_name: str,
+) -> tuple[bool, str]:
+    """Synthesize via Microsoft Edge TTS. Returns (ok, voice_id_used)."""
+    try:
+        import asyncio
+        import edge_tts
+    except ImportError as e:
+        print(f"  [TTS/edge] import failed: {e}")
+        return False, ""
+
+    voice = _pick_edge_voice(accent, gender, character_name)
+    rate, pitch = _EMOTION_PROSODY.get(emotion, ("0%", "+0Hz"))
+    mp3_raw = path.with_suffix(".raw.mp3")
+
+    async def _run():
+        comm = edge_tts.Communicate(text=text, voice=voice, rate=rate, pitch=pitch)
+        await comm.save(str(mp3_raw))
+
+    try:
+        try:
+            asyncio.run(asyncio.wait_for(_run(), timeout=30.0))
+        except RuntimeError:
+            # We're inside a running loop (rare in MCP sync tool, but handle it).
+            loop = asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(asyncio.wait_for(_run(), timeout=30.0))
+            finally:
+                loop.close()
+    except Exception as e:
+        print(f"  [TTS/edge] synth failed (voice={voice}, emotion={emotion}): {e}")
+        return False, voice
+
+    if not mp3_raw.exists() or mp3_raw.stat().st_size == 0:
+        print(f"  [TTS/edge] empty output for voice={voice}")
+        return False, voice
+
+    if not _has_ffmpeg():
+        target = path.with_suffix(".mp3")
+        try:
+            mp3_raw.rename(target)
+        except OSError:
+            pass
+        return target.exists(), voice
+
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", str(mp3_raw),
+             "-ar", "22050", "-ac", "1", str(path)],
+            check=True, timeout=30,
+        )
+    except Exception as e:
+        print(f"  [TTS/edge] ffmpeg re-encode failed: {e}")
+        try:
+            mp3_raw.rename(path.with_suffix(".mp3"))
+        except OSError:
+            return False, voice
+        return path.with_suffix(".mp3").exists(), voice
+    finally:
+        mp3_raw.unlink(missing_ok=True)
+
+    return path.exists(), voice
+
 
 def _tts_gtts(text: str, path: Path, tld: str = "com", emotion: str = "neutral") -> bool:
     try:
@@ -241,7 +391,7 @@ def _tts_gtts(text: str, path: Path, tld: str = "com", emotion: str = "neutral")
             ["ffmpeg", "-y", "-loglevel", "error", "-i", str(mp3_raw),
              "-filter:a", f"atempo={tempo}", "-ar", "22050", "-ac", "1",
              str(path)],
-            check=True,
+            check=True, timeout=30,
         )
         mp3_raw.unlink(missing_ok=True)
         return path.exists()
@@ -254,26 +404,56 @@ def _tts_gtts(text: str, path: Path, tld: str = "com", emotion: str = "neutral")
 def voice_cloning_synthesizer(
     scene_id: int, character_name: str, dialogue_line: str,
     voice_profile: str = "default", emotion: str = "neutral", tld: str = "com",
+    gender: str = "", accent: str = "",
 ) -> str:
-    """PDF §5.2 Voice Synthesis Agent."""
+    """PDF §5.2 Voice Synthesis Agent — gender-aware via edge-tts, gTTS fallback."""
     safe_char = _safe_name(character_name)
     line_hash = hashlib.md5(dialogue_line.encode()).hexdigest()[:6]
     out_path  = AUDIO_DIR / f"scene_{scene_id:02d}_{safe_char}_{line_hash}.wav"
 
-    if _tts_gtts(dialogue_line, out_path, tld=tld, emotion=emotion):
+    resolved_accent = _resolve_accent(accent, tld)
+    resolved_gender = _normalize_gender(gender)
+
+    # Primary: edge-tts (true male/female Neural voices).
+    ok, voice_used = _tts_edge(
+        dialogue_line, out_path,
+        accent=resolved_accent, gender=resolved_gender,
+        emotion=emotion, character_name=character_name,
+    )
+    if ok:
         actual = out_path if out_path.exists() else out_path.with_suffix(".mp3")
-        words      = max(1, len(dialogue_line.split()))
-        tempo      = _EMOTION_TEMPO.get(emotion, 1.0)
-        duration_s = (words / 2.5) / tempo
+        actual_dur = _ffprobe_duration(actual) if _has_ffmpeg() else 0.0
+        if actual_dur <= 0:
+            words      = max(1, len(dialogue_line.split()))
+            actual_dur = words / 2.5
         return json.dumps({
-            "status": "success", "provider": f"gTTS[{tld}]",
+            "status": "success", "provider": f"edge-tts[{voice_used}]",
             "scene_id": scene_id, "character": character_name,
-            "emotion": emotion, "tempo_applied": tempo,
-            "voice_profile": voice_profile, "tld": tld,
-            "file": str(actual), "duration_s": round(duration_s, 2),
+            "emotion": emotion, "gender": resolved_gender, "accent": resolved_accent,
+            "voice_profile": voice_profile, "voice_id": voice_used,
+            "file": str(actual), "duration_s": round(actual_dur, 2),
             "text": dialogue_line,
         })
 
+    # Fallback 1: gTTS (no gender, but at least audible speech).
+    if _tts_gtts(dialogue_line, out_path, tld=tld, emotion=emotion):
+        actual = out_path if out_path.exists() else out_path.with_suffix(".mp3")
+        actual_dur = _ffprobe_duration(actual) if _has_ffmpeg() else 0.0
+        if actual_dur <= 0:
+            words      = max(1, len(dialogue_line.split()))
+            tempo      = _EMOTION_TEMPO.get(emotion, 1.0)
+            actual_dur = (words / 2.5) / tempo
+        return json.dumps({
+            "status": "success", "provider": f"gTTS[{tld}]",
+            "scene_id": scene_id, "character": character_name,
+            "emotion": emotion, "gender": resolved_gender, "accent": resolved_accent,
+            "voice_profile": voice_profile, "tld": tld,
+            "file": str(actual), "duration_s": round(actual_dur, 2),
+            "text": dialogue_line,
+            "note": "edge-tts unavailable — gTTS is gender-neutral",
+        })
+
+    # Fallback 2: silent placeholder so the pipeline never stalls.
     words = max(1, len(dialogue_line.split()))
     duration_s = words / 2.5
     _generate_silent_wav(out_path, duration_s)

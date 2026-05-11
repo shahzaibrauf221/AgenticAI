@@ -228,6 +228,7 @@
       <textarea id="editQuery" rows="3" placeholder="e.g. Make scene 2 darker and keep dialogue same"></textarea>
       <div style="margin-top:10px;" class="row">
         <button id="btnRunEdit" class="primary">Apply edit</button>
+        <button id="btnRecompose" title="Re-stitch outputs/final/final_output.mp4 from the latest per-scene MP4s (picks up _darker, _sepia, etc.)">Recompose video</button>
         <button id="btnRefreshEdit">Refresh history</button>
       </div>
       <div style="margin-top:10px;">
@@ -640,6 +641,12 @@ $("btnPhase3").onclick = () => {
 $("btnClearLog").onclick = () => { logsEl.innerHTML = ""; };
 $("btnRefresh").onclick  = refreshOutputs;
 $("btnRunEdit").onclick = runEditCommand;
+$("btnRecompose").onclick = async () => {
+  const prev = $("editQuery").value;
+  $("editQuery").value = "recompose video";
+  try { await runEditCommand(); }
+  finally { $("editQuery").value = prev; }
+};
 $("btnRefreshEdit").onclick = async () => {
   await refreshLatestEditVersion();
   await refreshEditHistory();

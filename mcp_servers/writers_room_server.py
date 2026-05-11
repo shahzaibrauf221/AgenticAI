@@ -63,9 +63,12 @@ _memory_collection = _chroma_client.get_or_create_collection(
 # ─── Groq Setup ───────────────────────────────────────────────────────────────
 _groq_client = Groq(api_key=os.environ["GROQ_API_KEY"])
 
+# `llama-3.1-70b-versatile` was decommissioned by Groq — replaced with the
+# current Llama 4 Scout. Order is preference: 70B first, then Scout, then 8B
+# instant as a fast fallback.
 _MODELS = [
     "llama-3.3-70b-versatile",
-    "llama-3.1-70b-versatile",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
     "llama-3.1-8b-instant",
 ]
 

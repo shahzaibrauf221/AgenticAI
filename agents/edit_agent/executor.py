@@ -155,6 +155,23 @@ async def execute_edit(state: EditAgentState) -> EditAgentState:
             current_state = {}
             logs.append(f"[executor] Version {version} not found, using empty state")
 
+        if intent == "clarify_request":
+            note = (
+                f"Your command targets {scope} but didn't say what to change. "
+                f"Try: 'make {scope} darker', 'add background music to {scope}', "
+                f"'change the dialogue in {scope}', 'speed up {scope}', "
+                f"'regenerate the image for {scope}', or 'change voice tone in {scope}'."
+            )
+            logs.append(f"[executor] clarify_request — no edit applied. {note}")
+            return {
+                **state,
+                "result": {"type": "clarify", "applied": False, "note": note,
+                           "scope": scope, "asset_paths": []},
+                "new_version": version,
+                "status": "needs_clarification",
+                "logs": logs,
+            }
+
         if target == "audio":
             result = await _handle_audio_edit(intent, scope, parameters, current_state, logs)
         elif target == "video_frame":
@@ -423,6 +440,22 @@ _FILTER_PRESETS: dict[str, dict] = {
     "vivid":     {"saturation": 1.5,  "contrast": 1.2},
 }
 
+# FFmpeg -vf equivalents — used when scenes only exist as MP4 clips
+_FFMPEG_FILTER_VF: dict[str, str] = {
+    "darker":    "eq=brightness=-0.2:contrast=1.0",
+    "brighter":  "eq=brightness=0.15:contrast=1.1",
+    "grayscale": "format=gray",
+    "vivid":     "eq=saturation=1.5:contrast=1.2",
+    "sepia":     ("colorchannelmixer=rr=0.393:rg=0.769:rb=0.189"
+                  ":gr=0.349:gg=0.686:gb=0.168"
+                  ":br=0.272:bg=0.534:bb=0.131"),
+    "warm":      "colorbalance=rs=0.1:bs=-0.1",
+    "cool":      "colorbalance=rs=-0.1:bs=0.1",
+    "vintage":   ("eq=saturation=0.7:brightness=-0.05,"
+                  "colorchannelmixer=rr=0.9:rg=0.5:rb=0.1"
+                  ":gr=0.3:gg=0.7:gb=0.2:br=0.2:bg=0.5:bb=0.5"),
+}
+
 
 def _apply_filter(image_path: Path, filter_name: str, output_path: Path) -> bool:
     return apply_filter_to_image(image_path=image_path, filter_name=filter_name, output_path=output_path)
@@ -491,6 +524,11 @@ async def _apply_image_filter(filter_name: str, scope: str, logs: list[str]) -> 
         if not targets:
             targets = [p for p in _IMAGE_DIR.iterdir() if p.suffix.lower() in exts]
 
+    if not targets:
+        # No still images for this scope — fall back to filtering the scene MP4(s).
+        logs.append(f"[executor:video_frame] No images for {scope}; trying scene MP4 fallback")
+        return await _apply_video_color_filter(filter_name, scope, logs)
+
     logs.append(f"[executor:video_frame] Filter '{filter_name}' on {len(targets)} image(s)")
     asset_paths: list[str] = []
     for img_path in targets:
@@ -503,6 +541,84 @@ async def _apply_image_filter(filter_name: str, scope: str, logs: list[str]) -> 
 
     return {"type": "video_frame", "intent": f"apply_{filter_name}_filter",
             "filter": filter_name, "images_edited": len(asset_paths),
+            "asset_paths": asset_paths, "applied": bool(asset_paths)}
+
+
+async def _apply_video_color_filter(filter_name: str, scope: str, logs: list[str]) -> dict:
+    """
+    Fallback for projects where scenes are MP4 clips, not still frames.
+    Picks the best per-scene MP4 in outputs/video/ and applies an FFmpeg
+    -vf filter, writing scene_NN_..._<filter>.mp4 alongside the source.
+    """
+    vf = _FFMPEG_FILTER_VF.get(filter_name)
+    if not vf:
+        msg = f"No FFmpeg mapping for filter '{filter_name}'"
+        logs.append(f"[executor:video_frame] {msg}")
+        return {"type": "video_frame", "intent": f"apply_{filter_name}_filter",
+                "filter": filter_name, "asset_paths": [], "applied": False, "note": msg}
+
+    if not _has_ffmpeg():
+        msg = "FFmpeg not installed — cannot apply color filter to scene MP4"
+        logs.append(f"[executor:video_frame] {msg}")
+        return {"type": "video_frame", "intent": f"apply_{filter_name}_filter",
+                "filter": filter_name, "asset_paths": [], "applied": False, "note": msg}
+
+    video_dir = _OUTPUTS_DIR / "video"
+    if not video_dir.exists():
+        msg = f"{video_dir} does not exist — run Phase 3 first"
+        logs.append(f"[executor:video_frame] {msg}")
+        return {"type": "video_frame", "intent": f"apply_{filter_name}_filter",
+                "filter": filter_name, "asset_paths": [], "applied": False, "note": msg}
+
+    # Resolve which scene MP4(s) to filter.
+    if scope.startswith("scene:"):
+        sid = scope.split(":", 1)[1].strip()
+        sid_padded = sid.zfill(2)
+        prefix = f"scene_{sid_padded}_"
+    else:
+        prefix = "scene_"
+
+    all_mp4s = [p for p in video_dir.glob(f"{prefix}*.mp4")
+                if f"_{filter_name}" not in p.stem]  # don't re-filter our own outputs
+
+    # Group by scene_id and prefer the most-processed variant per scene.
+    by_scene: dict[str, Path] = {}
+    def _rank(p: Path) -> int:
+        n = p.name
+        if "_synced_aud" in n: return 3
+        if "_synced"     in n: return 2
+        return 1
+    for p in all_mp4s:
+        # Extract scene_NN prefix (first two underscore-separated tokens)
+        parts = p.stem.split("_")
+        key = "_".join(parts[:2]) if len(parts) >= 2 else p.stem
+        if key not in by_scene or _rank(p) > _rank(by_scene[key]):
+            by_scene[key] = p
+
+    sources = sorted(by_scene.values())
+    if not sources:
+        msg = f"No '{prefix}*.mp4' found in {video_dir}"
+        logs.append(f"[executor:video_frame] {msg}")
+        return {"type": "video_frame", "intent": f"apply_{filter_name}_filter",
+                "filter": filter_name, "asset_paths": [], "applied": False, "note": msg}
+
+    asset_paths: list[str] = []
+    for src in sources:
+        out = src.with_name(f"{src.stem}_{filter_name}{src.suffix}")
+        cmd = ["ffmpeg", "-y", "-i", str(src), "-vf", vf, "-c:a", "copy", str(out)]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            if proc.returncode == 0:
+                asset_paths.append(str(out))
+                logs.append(f"[executor:video_frame] ✓ {out.name}")
+            else:
+                logs.append(f"[executor:video_frame] ✗ ffmpeg failed for {src.name}: "
+                            f"{proc.stderr[:200]}")
+        except subprocess.TimeoutExpired:
+            logs.append(f"[executor:video_frame] ✗ ffmpeg timeout on {src.name}")
+
+    return {"type": "video_frame", "intent": f"apply_{filter_name}_filter",
+            "filter": filter_name, "videos_edited": len(asset_paths),
             "asset_paths": asset_paths, "applied": bool(asset_paths)}
 
 
@@ -652,6 +768,11 @@ def _has_ffmpeg() -> bool:
 async def _handle_video_edit(intent: str, scope: str, parameters: dict, state: dict, logs: list[str]) -> dict:
     logs.append(f"[executor:video] intent={intent}")
 
+    # ── recompose_video: re-stitch the final MP4 from per-scene clips, picking
+    # the newest variant per scene so edits like '_darker' get picked up.
+    if intent == "recompose_video":
+        return await _recompose_final_video(state, logs)
+
     video_candidates = sorted((_OUTPUTS_DIR / "final").glob("*.mp4")) if (_OUTPUTS_DIR / "final").exists() else []
     if not video_candidates:
         video_candidates = list(_OUTPUTS_DIR.glob("*.mp4"))
@@ -708,6 +829,175 @@ async def _handle_video_edit(intent: str, scope: str, parameters: dict, state: d
     except subprocess.TimeoutExpired:
         logs.append("[executor:video] FFmpeg timed out")
         return {"type": "video", "intent": intent, "asset_paths": [], "applied": False, "note": "FFmpeg timed out"}
+
+
+# ─── Recompose helper ─────────────────────────────────────────────────────────
+
+def _pick_scene_clip(video_dir: Path, scene_id: int) -> Path | None:
+    """
+    Pick the best per-scene MP4 for `recompose_video`.
+    Tier:  _synced_aud > _synced > plain.
+    Within tier: newest mtime wins, so a freshly-produced _darker / _sepia
+    variant beats the original `_synced_aud.mp4` automatically.
+    """
+    sid_padded = str(scene_id).zfill(2)
+    cands = list(video_dir.glob(f"scene_{sid_padded}_*.mp4"))
+    if not cands:
+        return None
+
+    def _tier(p: Path) -> int:
+        n = p.name
+        if "_synced_aud" in n: return 3
+        if "_synced"     in n: return 2
+        return 1
+
+    cands.sort(key=lambda p: (_tier(p), p.stat().st_mtime), reverse=True)
+    return cands[0]
+
+
+async def _recompose_final_video(state: dict, logs: list[str]) -> dict:
+    """
+    Stitch outputs/video/scene_NN_*.mp4 (newest variant per scene) into
+    outputs/final/final_output.mp4 — without re-running phase 3.
+    """
+    if not _has_ffmpeg():
+        msg = "FFmpeg not installed — cannot recompose final video"
+        logs.append(f"[executor:video] {msg}")
+        return {"type": "video", "intent": "recompose_video",
+                "asset_paths": [], "applied": False, "note": msg}
+
+    video_dir = _OUTPUTS_DIR / "video"
+    if not video_dir.exists():
+        msg = f"{video_dir} does not exist — run Phase 3 first"
+        logs.append(f"[executor:video] {msg}")
+        return {"type": "video", "intent": "recompose_video",
+                "asset_paths": [], "applied": False, "note": msg}
+
+    # Resolve scene order from manifest (fall back to filename ordering).
+    scenes = state.get("scenes", [])
+    if not scenes:
+        manifest = _PROJECT_ROOT / "outputs" / "scene_manifest.json"
+        if manifest.exists():
+            try:
+                scenes = json.loads(manifest.read_text(encoding="utf-8")).get("scenes", [])
+            except Exception:
+                pass
+
+    scene_ids: list[int] = []
+    if scenes:
+        for s in sorted(scenes, key=lambda x: x.get("scene_id", 0)):
+            try:
+                scene_ids.append(int(s.get("scene_id")))
+            except (TypeError, ValueError):
+                continue
+    else:
+        # Fallback: derive from filenames
+        seen: set[int] = set()
+        for p in sorted(video_dir.glob("scene_*.mp4")):
+            m = re.match(r"scene_(\d+)_", p.name)
+            if m:
+                seen.add(int(m.group(1)))
+        scene_ids = sorted(seen)
+
+    if not scene_ids:
+        msg = "No scenes found in manifest or outputs/video/"
+        logs.append(f"[executor:video] {msg}")
+        return {"type": "video", "intent": "recompose_video",
+                "asset_paths": [], "applied": False, "note": msg}
+
+    scene_files: list[Path] = []
+    for sid in scene_ids:
+        clip = _pick_scene_clip(video_dir, sid)
+        if clip is None:
+            logs.append(f"[executor:video] ⚠ no MP4 for scene {sid:02d} — skipping")
+            continue
+        scene_files.append(clip)
+        logs.append(f"[executor:video] scene {sid:02d} → {clip.name}")
+
+    if not scene_files:
+        msg = "No usable per-scene MP4s found"
+        logs.append(f"[executor:video] {msg}")
+        return {"type": "video", "intent": "recompose_video",
+                "asset_paths": [], "applied": False, "note": msg}
+
+    out_dir = _OUTPUTS_DIR / "final"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "final_output.mp4"
+
+    # Probe for audio streams (face-swap clips may have none).
+    has_audio: list[bool] = []
+    for f in scene_files:
+        try:
+            probe = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "a:0",
+                 "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(f)],
+                capture_output=True, text=True, timeout=20,
+            )
+            has_audio.append(bool(probe.stdout.strip()))
+        except Exception:
+            has_audio.append(False)
+
+    # Normalise every clip to 1280x720@24fps then concat — robust to mixed inputs.
+    TW, TH, TFPS = 1280, 720, 24
+    n = len(scene_files)
+    input_args: list[str] = []
+    for f in scene_files:
+        input_args += ["-i", str(f)]
+
+    vparts = [
+        f"[{i}:v]scale={TW}:{TH}:force_original_aspect_ratio=decrease,"
+        f"pad={TW}:{TH}:(ow-iw)/2:(oh-ih)/2,fps={TFPS}[v{i}];"
+        for i in range(n)
+    ]
+    vparts.append("".join(f"[v{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=0[vout];")
+
+    aparts: list[str] = []
+    for i, f in enumerate(scene_files):
+        if has_audio[i]:
+            aparts.append(f"[{i}:a:0]aresample=44100[a{i}];")
+        else:
+            try:
+                dur_proc = subprocess.run(
+                    ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                     "-of", "csv=p=0", str(f)],
+                    capture_output=True, text=True, timeout=20,
+                )
+                dur = float(dur_proc.stdout.strip() or "1.0")
+            except Exception:
+                dur = 1.0
+            aparts.append(f"anullsrc=r=44100:cl=stereo,atrim=0:{dur:.3f}[a{i}];")
+    aparts.append("".join(f"[a{i}]" for i in range(n)) + f"concat=n={n}:v=0:a=1[aout]")
+
+    full_filter = "".join(vparts) + "".join(aparts)
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        *input_args,
+        "-filter_complex", full_filter,
+        "-map", "[vout]", "-map", "[aout]",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-c:a", "aac", "-b:a", "192k",
+        "-movflags", "+faststart",
+        str(out_path),
+    ]
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+    except subprocess.TimeoutExpired:
+        logs.append("[executor:video] FFmpeg timed out during recompose")
+        return {"type": "video", "intent": "recompose_video",
+                "asset_paths": [], "applied": False, "note": "FFmpeg timed out"}
+
+    if proc.returncode != 0:
+        logs.append(f"[executor:video] FFmpeg error: {proc.stderr[:400]}")
+        return {"type": "video", "intent": "recompose_video",
+                "asset_paths": [], "applied": False,
+                "ffmpeg_error": proc.stderr[:400]}
+
+    logs.append(f"[executor:video] ✓ Recomposed → {out_path}")
+    return {"type": "video", "intent": "recompose_video",
+            "scenes_used": [str(p) for p in scene_files],
+            "output": str(out_path),
+            "asset_paths": [str(out_path)], "applied": True}
 
 
 # ─── Script edits ─────────────────────────────────────────────────────────────

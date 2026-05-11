@@ -45,6 +45,9 @@ INTENT_CATALOGUE: dict[str, dict] = {
     "regenerate_script":    {"target": "script",      "desc": "Re-run story/script phase for the full video"},
     "change_scene_dialogue":{"target": "script",      "desc": "Rewrite the dialogue for a specific scene"},
     "change_scene_tone":    {"target": "script",      "desc": "Change the emotional tone of a scene"},
+
+    # Meta intent — used when the user's command is too vague to act on
+    "clarify_request":      {"target": "video",       "desc": "Query is ambiguous; ask the user what kind of edit they want"},
 }
 
 _INTENT_LIST_STR = "\n".join(
@@ -69,6 +72,9 @@ Supported intents:
 
 Rules:
 - Pick the CLOSEST matching intent. Never invent new intent keys.
+- If the user only names a scene/character but does NOT describe what to change
+  (e.g. "edit scene 2", "fix scene 1", "modify the narrator"), use
+  intent="clarify_request" with target="video" — DO NOT default to recompose_video.
 - If the user mentions a character name, set scope to "character:<Name>".
 - If the user mentions a scene number, set scope to "scene:<N>".
 - If the user says 'all' or gives no specific scope, set scope to "all".
@@ -146,11 +152,15 @@ _KEYWORD_MAP: list[tuple[list[str], str]] = [
 
 def _keyword_classify(query: str) -> tuple[str, str, str, dict]:
     q = query.lower()
+    scope = _extract_scope(q)
     for keywords, intent_key in _KEYWORD_MAP:
         if any(kw in q for kw in keywords):
             meta = INTENT_CATALOGUE[intent_key]
-            scope = _extract_scope(q)
             return intent_key, meta["target"], scope, {}
+    # No edit verb matched. If the user only named a scope (e.g. "edit scene 2"),
+    # ask for clarification rather than blindly recomposing the whole video.
+    if scope != "all":
+        return "clarify_request", "video", scope, {}
     return "recompose_video", "video", "all", {}
 
 

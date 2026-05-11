@@ -99,8 +99,21 @@ _EMOTION_BY_TRAIT = {
 _TLD_POOL = ["com", "co.uk", "com.au", "co.in", "ca", "ie"]
 
 
+def _normalize_gender(g: str) -> str:
+    g = (g or "").strip().lower()
+    if g in {"male", "m", "man", "boy"}:
+        return "male"
+    if g in {"female", "f", "woman", "girl"}:
+        return "female"
+    return ""  # unknown — let TTS layer decide its own default
+
+
 def _build_voice_profile(character_name: str, char_db: dict) -> dict:
-    """Derive a TTS voice profile for `character_name` from the character DB."""
+    """Derive a TTS voice profile for `character_name` from the character DB.
+
+    Always includes `gender` and `accent` so the TTS server can pick a
+    male/female Neural voice instead of falling back to a gender-neutral one.
+    """
     chars = (char_db or {}).get("characters", []) if isinstance(char_db, dict) else []
     found = next(
         (c for c in chars
@@ -109,20 +122,26 @@ def _build_voice_profile(character_name: str, char_db: dict) -> dict:
         {},
     )
 
+    accent_to_tld = {"american": "com", "british": "co.uk",
+                     "australian": "com.au", "indian": "co.in",
+                     "canadian": "ca", "irish": "ie"}
+
     # Prefer voice_personality from the unified script.json (Phase 1 spec)
     vp = found.get("voice_personality", {}) if isinstance(found, dict) else {}
     if vp:
         emotion = vp.get("tone", "neutral")
-        accent  = vp.get("accent", "american").lower()
-        accent_to_tld = {"american": "com", "british": "co.uk",
-                         "australian": "com.au", "indian": "co.in",
-                         "canadian": "ca", "irish": "ie"}
-        tld = accent_to_tld.get(accent, "com")
+        accent  = (vp.get("accent", "american") or "american").lower()
+        tld     = accent_to_tld.get(accent, "com")
+        # Gender source priority: voice_personality.gender → character.gender
+        gender  = _normalize_gender(vp.get("gender", "")) \
+                  or _normalize_gender(found.get("gender", ""))
         return {
             "character_id": found.get("character_id", ""),
             "character":    character_name,
             "voice_id":     f"voice_{character_name.lower().replace(' ', '_')}",
             "tld":          tld,
+            "accent":       accent,
+            "gender":       gender,
             "emotion":      emotion,
             "traits":       found.get("personality_traits", [])[:3],
         }
@@ -130,6 +149,8 @@ def _build_voice_profile(character_name: str, char_db: dict) -> dict:
     # Fallback — derive from traits + gender
     idx = sum(ord(c) for c in character_name) % len(_TLD_POOL)
     tld = _TLD_POOL[idx]
+    accent_by_tld = {v: k for k, v in accent_to_tld.items()}
+    accent = accent_by_tld.get(tld, "american")
 
     traits = [t.lower() for t in found.get("personality_traits", [])]
     emotion = "neutral"
@@ -138,7 +159,7 @@ def _build_voice_profile(character_name: str, char_db: dict) -> dict:
             emotion = _EMOTION_BY_TRAIT[t]
             break
 
-    gender = (found.get("gender") or "").lower()
+    gender = _normalize_gender(found.get("gender", ""))
     if emotion == "neutral" and gender:
         emotion = "warm" if gender == "female" else "calm"
 
@@ -147,6 +168,8 @@ def _build_voice_profile(character_name: str, char_db: dict) -> dict:
         "character":    character_name,
         "voice_id":     f"voice_{character_name.lower().replace(' ', '_')}",
         "tld":          tld,
+        "accent":       accent,
+        "gender":       gender,
         "emotion":      emotion,
         "traits":       traits[:3],
     }
@@ -284,6 +307,8 @@ async def voice_synth_node(state: AgentState) -> dict:
             scene_id=sid, character_name=speaker, dialogue_line=line,
             voice_profile=profile["voice_id"], emotion=profile["emotion"],
             tld=profile["tld"],
+            gender=profile.get("gender", ""),
+            accent=profile.get("accent", ""),
         )
         try:
             result = _safe_parse(raw)

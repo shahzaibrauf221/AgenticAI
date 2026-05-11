@@ -27,6 +27,7 @@ INTENT_TO_TARGET: dict[str, EditTarget] = {
     "regenerate_script": "script",
     "change_scene_dialogue": "script",
     "change_scene_tone": "script",
+    "clarify_request": "video",
 }
 
 
