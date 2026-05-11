@@ -79,6 +79,10 @@ Rules:
 - If the user mentions a scene number, set scope to "scene:<N>".
 - If the user says 'all' or gives no specific scope, set scope to "all".
 - Extract any style/tone/filter words into parameters.
+- For a colour/look change (grey, black & white, sepia, washed out / white / faded,
+  warm, cool, vivid / vibrant, vintage / retro), use intent="apply_color_filter"
+  with parameters {{"filter": "<grayscale|washed|sepia|warm|cool|vivid|vintage>"}}.
+  Only "darker"/"dimmer" -> make_scene_darker, "brighter"/"lighter" -> make_scene_brighter.
 - Return ONLY the JSON object. No explanation.
 """
 
@@ -133,9 +137,27 @@ async def classify_intent(state: EditAgentState) -> EditAgentState:
 
 # ─── Keyword fallback ─────────────────────────────────────────────────────────
 
+# Colour/look words → canonical filter key (used by apply_color_filter). Checked
+# BEFORE _KEYWORD_MAP so "grey", "washed out", "vibrant", … route to a real filter
+# rather than falling through. ("darker"/"brighter" stay as their own intents.)
+_FILTER_KEYWORDS: dict[str, str] = {
+    "grayscale": "grayscale", "greyscale": "grayscale", "grey": "grayscale",
+    "gray": "grayscale", "monochrome": "grayscale", "b&w": "grayscale",
+    "black and white": "grayscale", "black-and-white": "grayscale",
+    "sepia": "sepia",
+    "washed out": "washed", "washed-out": "washed", "washed": "washed",
+    "faded": "washed", "bleached": "washed", "overexposed": "washed",
+    "white": "washed", "whiter": "washed", "pale": "washed", "milky": "washed",
+    "warm tone": "warm", "warmer": "warm",
+    "cool tone": "cool", "cooler": "cool",
+    "vivid": "vivid", "vibrant": "vivid", "saturated": "vivid",
+    "colorful": "vivid", "colourful": "vivid", "punchy": "vivid",
+    "vintage": "vintage", "retro": "vintage", "old film": "vintage", "old-film": "vintage",
+}
+
 _KEYWORD_MAP: list[tuple[list[str], str]] = [
     (["darker", "dark", "dim"],                   "make_scene_darker"),
-    (["brighter", "bright", "vivid"],             "make_scene_brighter"),
+    (["brighter", "bright", "lighter"],           "make_scene_brighter"),
     (["subtitle", "caption"],                     "remove_subtitle"),
     (["background music", "bgm", "music"],        "add_background_music"),
     (["voice tone", "tone"],                      "change_voice_tone"),
@@ -144,7 +166,7 @@ _KEYWORD_MAP: list[tuple[list[str], str]] = [
     (["regenerate script", "rewrite script", "the script"],     "regenerate_script"),
     (["speed up", "faster"],                      "speed_up_scene"),
     (["slow down", "slower"],                     "slow_down_scene"),
-    (["color filter", "filter"],                  "apply_color_filter"),
+    (["color filter", "colour filter", "filter"], "apply_color_filter"),
     (["dialogue", "rewrite line"],                "change_scene_dialogue"),
     (["style"],                                   "change_scene_style"),
 ]
@@ -153,6 +175,12 @@ _KEYWORD_MAP: list[tuple[list[str], str]] = [
 def _keyword_classify(query: str) -> tuple[str, str, str, dict]:
     q = query.lower()
     scope = _extract_scope(q)
+
+    # Colour/look filter words win first (so "make scene 2 grey" doesn't fall through).
+    for kw, canonical in _FILTER_KEYWORDS.items():
+        if kw in q:
+            return "apply_color_filter", "video_frame", scope, {"filter": canonical}
+
     for keywords, intent_key in _KEYWORD_MAP:
         if any(kw in q for kw in keywords):
             meta = INTENT_CATALOGUE[intent_key]

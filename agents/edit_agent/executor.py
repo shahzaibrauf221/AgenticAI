@@ -507,6 +507,7 @@ _FILTER_PRESETS: dict[str, dict] = {
     "cool":      {"hue_shift": -20},
     "vintage":   {"brightness": 0.85, "sepia": True},
     "vivid":     {"saturation": 1.5,  "contrast": 1.2},
+    "washed":    {"brightness": 1.4,  "contrast": 0.95},
 }
 
 # FFmpeg -vf equivalents — used when scenes only exist as MP4 clips
@@ -515,6 +516,7 @@ _FFMPEG_FILTER_VF: dict[str, str] = {
     "brighter":  "eq=brightness=0.15:contrast=1.1",
     "grayscale": "format=gray",
     "vivid":     "eq=saturation=1.5:contrast=1.2",
+    "washed":    "eq=brightness=0.18:saturation=0.30:contrast=0.92",   # faded / near-white look
     "sepia":     ("colorchannelmixer=rr=0.393:rg=0.769:rb=0.189"
                   ":gr=0.349:gg=0.686:gb=0.168"
                   ":br=0.272:bg=0.534:bb=0.131"),
@@ -524,6 +526,39 @@ _FFMPEG_FILTER_VF: dict[str, str] = {
                   "colorchannelmixer=rr=0.9:rg=0.5:rb=0.1"
                   ":gr=0.3:gg=0.7:gb=0.2:br=0.2:bg=0.5:bb=0.5"),
 }
+
+# User-facing words → canonical filter key. So "grey", "black and white", "washed
+# out", "white", "vibrant", … all resolve to a real filter above.
+_FILTER_ALIASES: dict[str, str] = {
+    "gray": "grayscale", "grey": "grayscale", "greyscale": "grayscale",
+    "monochrome": "grayscale", "mono": "grayscale", "bw": "grayscale",
+    "b&w": "grayscale", "black and white": "grayscale", "black-and-white": "grayscale",
+    "white": "washed", "whiter": "washed", "whitish": "washed",
+    "washed out": "washed", "washed-out": "washed", "faded": "washed",
+    "fade": "washed", "bleach": "washed", "bleached": "washed",
+    "overexposed": "washed", "pale": "washed", "milky": "washed",
+    "retro": "vintage", "oldfilm": "vintage", "old film": "vintage", "old-film": "vintage",
+    "warmer": "warm", "warmth": "warm",
+    "cooler": "cool", "colder": "cool", "blue": "cool",
+    "vibrant": "vivid", "saturated": "vivid", "colorful": "vivid", "colourful": "vivid",
+    "punchy": "vivid", "pop": "vivid",
+    "dim": "darker", "dark": "darker", "darken": "darker", "moody": "darker",
+    "bright": "brighter", "brighten": "brighter", "lighter": "brighter", "lighten": "brighter",
+}
+
+
+def _resolve_filter(name: str) -> str:
+    """Normalise a user/LLM filter word to a known _FFMPEG_FILTER_VF key.
+
+    Unknown names pass through unchanged (so _apply_video_color_filter can report
+    'no FFmpeg mapping'); an empty/missing name defaults to 'sepia' (legacy behaviour).
+    """
+    n = (name or "").strip().lower()
+    if not n:
+        return "sepia"
+    if n in _FFMPEG_FILTER_VF:
+        return n
+    return _FILTER_ALIASES.get(n, n)
 
 
 def _apply_filter(image_path: Path, filter_name: str, output_path: Path) -> bool:
@@ -579,12 +614,22 @@ def _scene_mp4s_exist(scope: str) -> bool:
 async def _apply_scene_visual_filter(filter_name: str, scope: str, logs: list[str]) -> dict:
     """Darken / brighten / colour-filter a scene.
 
+    `filter_name` accepts user words too — 'grey', 'black and white', 'washed out',
+    'white', 'vibrant', 'retro', … are normalised via _resolve_filter to a real
+    filter (grayscale / washed / vivid / vintage / warm / cool / sepia / darker /
+    brighter). Supported looks: darker, brighter, grayscale, washed, vivid, sepia,
+    warm, cool, vintage.
+
     This project renders scenes as MP4 clips and the final video is stitched from
     those clips — the still frames in outputs/frames/ are stale render artifacts the
     final video never uses. So filter the scene video(s) first (writes
     scene_NN_..._<filter>.mp4, which the recompose picker prefers as the newest
     variant), and fall back to filtering still frames only when there's no scene clip.
     """
+    requested = filter_name
+    filter_name = _resolve_filter(filter_name)
+    if filter_name != (requested or "").strip().lower():
+        logs.append(f"[executor:video_frame] filter '{requested}' → '{filter_name}'")
     if _scene_mp4s_exist(scope):
         result = await _apply_video_color_filter(filter_name, scope, logs)
         if result.get("applied"):
