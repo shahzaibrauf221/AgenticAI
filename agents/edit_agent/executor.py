@@ -38,6 +38,22 @@ _AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 _IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 _FRAMES_DIR.mkdir(parents=True, exist_ok=True)
 
+
+def _phase1_outputs_dir() -> Path:
+    """Directory where Phase 1 (writers_room_server) writes scene_manifest.json.
+
+    Canonically <project_root>/outputs/. Some older callers passed
+    <project_root>/data/outputs/, which is why a pipeline rerun would die with
+    "scene_manifest.json not found at ...data/outputs/...". Resolve to wherever
+    the manifest actually is, preferring outputs/.
+    """
+    if (_OUTPUTS_DIR / "scene_manifest.json").exists():
+        return _OUTPUTS_DIR
+    legacy = _PROJECT_ROOT / "data" / "outputs"
+    if (legacy / "scene_manifest.json").exists():
+        return legacy
+    return _OUTPUTS_DIR
+
 # ─── MCP helpers ──────────────────────────────────────────────────────────────
 
 _STUDIO_CONFIG = {
@@ -196,7 +212,7 @@ async def execute_edit(state: EditAgentState) -> EditAgentState:
 
             pipeline_result = await run_targeted_rerun(
                 entry_phase=rerun_from,
-                phase1_dir=_PROJECT_ROOT / "data" / "outputs",
+                phase1_dir=_phase1_outputs_dir(),
                 prompt=parameters.get("prompt", current_state.get("user_prompt", "")),
             )
             result["pipeline_rerun"] = pipeline_result
@@ -349,27 +365,80 @@ def _direct_gtts(scene_id: int, character: str, line: str, emotion: str, tld: st
     return None
 
 
+def _overlay_bgm_on_scene_clip(scene_id: int, bgm_path: str, logs: list[str]) -> str | None:
+    """Mix `bgm_path` (ducked under any existing dialogue) into the scene's best
+    clip → outputs/video/scene_NN_..._bgm.mp4, so the next recompose picks it up.
+
+    Self-contained: no Phase 2/3 rerun, no ByteDance, doesn't disturb other per-scene
+    edit variants. Returns the new clip path, or None if ffmpeg/clip/bgm is missing.
+    """
+    if not _has_ffmpeg() or not bgm_path or not Path(bgm_path).exists():
+        return None
+    src = _pick_scene_clip(_OUTPUTS_DIR / "video", scene_id)
+    if src is None:
+        logs.append(f"[executor:audio] no scene-{scene_id} clip to overlay BGM onto — run Phase 3 first")
+        return None
+    out = src.with_name(f"{src.stem}_bgm{src.suffix}")
+    has_audio = bool(subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a:0",
+         "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(src)],
+        capture_output=True, text=True).stdout.strip())
+    if has_audio:
+        # dialogue stays at full volume; BGM ducked to ~25%
+        fc = ("[1:a]volume=0.25[bg];"
+              "[0:a][bg]amix=inputs=2:duration=first:dropout_transition=2[aout]")
+        cmd = ["ffmpeg", "-y", "-i", str(src), "-i", str(Path(bgm_path)),
+               "-filter_complex", fc, "-map", "0:v", "-map", "[aout]",
+               "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-shortest", str(out)]
+    else:
+        cmd = ["ffmpeg", "-y", "-i", str(src), "-i", str(Path(bgm_path)),
+               "-map", "0:v", "-map", "1:a",
+               "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-shortest", str(out)]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if proc.returncode == 0 and out.exists() and out.stat().st_size > 0:
+            logs.append(f"[executor:audio] ✓ BGM mixed into scene {scene_id} → {out.name}")
+            return str(out)
+        logs.append(f"[executor:audio] ✗ ffmpeg BGM overlay scene {scene_id}: {proc.stderr[:250]}")
+    except subprocess.TimeoutExpired:
+        logs.append(f"[executor:audio] ✗ ffmpeg BGM overlay timed out scene {scene_id}")
+    return None
+
+
 async def _add_bgm(scope: str, parameters: dict, state: dict, logs: list[str]) -> dict:
     scene_id = int(scope.replace("scene:", "")) if scope.startswith("scene:") else 1
     mood     = parameters.get("mood", "cinematic")
     duration = float(parameters.get("duration", 10.0))
 
-    studio_up = await _mcp_available("studio")
-    if studio_up:
+    # 1) Get a BGM track (MCP, else local synth fallback).
+    bgm_path = ""
+    res: dict | None = None
+    if await _mcp_available("studio"):
         logs.append(f"[executor:audio] MCP → generate_background_music scene={scene_id} mood={mood}")
         res = await _call_studio("generate_background_music", logs,
                                  scene_id=scene_id, mood=mood, duration_s=duration)
         if res and res.get("status") == "success":
-            fpath = res.get("file", "")
-            return {"type": "audio", "intent": "add_background_music", "scene_id": scene_id,
-                    "mood": mood, "asset_paths": [fpath] if fpath else [], "applied": True, "result": res}
-        logs.append(f"[executor:audio] BGM MCP failed: {res}")
+            bgm_path = res.get("file", "") or ""
+        else:
+            logs.append(f"[executor:audio] BGM MCP failed: {res}")
+    if not bgm_path:
+        logs.append("[executor:audio] Generating BGM directly (no MCP)")
+        bgm_path = _generate_bgm_direct(scene_id, mood, duration, logs) or ""
+    if not bgm_path:
+        return {"type": "audio", "intent": "add_background_music", "scene_id": scene_id,
+                "mood": mood, "asset_paths": [], "applied": False,
+                "note": "could not produce a BGM track"}
 
-    # Fallback: generate simple BGM directly
-    logs.append("[executor:audio] Generating BGM directly (no MCP)")
-    fpath = _generate_bgm_direct(scene_id, mood, duration, logs)
+    # 2) Mix it straight onto the scene's video clip so a recompose picks it up.
+    new_clip = _overlay_bgm_on_scene_clip(scene_id, bgm_path, logs)
+    assets = [p for p in (new_clip, bgm_path) if p]
+    note = ("run 'recompose the video' to fold the new music into the final cut"
+            if new_clip else
+            "BGM track produced but no scene clip to overlay it onto — run Phase 3, then redo this edit")
     return {"type": "audio", "intent": "add_background_music", "scene_id": scene_id,
-            "mood": mood, "asset_paths": [fpath] if fpath else [], "applied": bool(fpath)}
+            "mood": mood, "bgm_track": bgm_path, "output": new_clip,
+            "asset_paths": assets, "applied": bool(new_clip), "note": note,
+            **({"result": res} if res else {})}
 
 
 def _generate_bgm_direct(scene_id: int, mood: str, duration: float, logs: list[str]) -> str | None:
@@ -464,14 +533,14 @@ def _apply_filter(image_path: Path, filter_name: str, output_path: Path) -> bool
 async def _handle_video_frame_edit(intent: str, scope: str, parameters: dict, state: dict, logs: list[str]) -> dict:
     logs.append(f"[executor:video_frame] intent={intent} scope={scope}")
 
-    # ── Image filters (local — no MCP needed) ─────────────────────────────────
+    # ── Visual filters (local — no MCP needed) ────────────────────────────────
     if intent in ("make_scene_darker", "make_scene_brighter", "apply_color_filter"):
         filter_map = {
             "make_scene_darker":   "darker",
             "make_scene_brighter": "brighter",
             "apply_color_filter":  parameters.get("filter", "sepia"),
         }
-        return await _apply_image_filter(filter_map[intent], scope, logs)
+        return await _apply_scene_visual_filter(filter_map[intent], scope, logs)
 
     # ── Change character design — call Writers Room MCP ───────────────────────
     if intent == "change_character_design":
@@ -483,6 +552,46 @@ async def _handle_video_frame_edit(intent: str, scope: str, parameters: dict, st
 
     logs.append(f"[executor:video_frame] Unhandled: {intent}")
     return {"type": "video_frame", "intent": intent, "asset_paths": [], "applied": False}
+
+
+def _scene_mp4s_exist(scope: str) -> bool:
+    """True if outputs/video/ has at least one *source* scene clip for `scope`.
+
+    Excludes our own filter outputs (scene_NN_..._darker.mp4 etc.) so a re-run of
+    'make scene N darker' still sees the original clip to filter.
+    """
+    video_dir = _OUTPUTS_DIR / "video"
+    if not video_dir.is_dir():
+        return False
+    if scope.startswith("scene:"):
+        sid = scope.split(":", 1)[1].strip().zfill(2)
+        pattern = f"scene_{sid}_*.mp4"
+    else:
+        pattern = "scene_*.mp4"
+    known_filters = set(_FFMPEG_FILTER_VF)
+    for p in video_dir.glob(pattern):
+        if p.stem.rsplit("_", 1)[-1] in known_filters:
+            continue  # this is itself a filter output
+        return True
+    return False
+
+
+async def _apply_scene_visual_filter(filter_name: str, scope: str, logs: list[str]) -> dict:
+    """Darken / brighten / colour-filter a scene.
+
+    This project renders scenes as MP4 clips and the final video is stitched from
+    those clips — the still frames in outputs/frames/ are stale render artifacts the
+    final video never uses. So filter the scene video(s) first (writes
+    scene_NN_..._<filter>.mp4, which the recompose picker prefers as the newest
+    variant), and fall back to filtering still frames only when there's no scene clip.
+    """
+    if _scene_mp4s_exist(scope):
+        result = await _apply_video_color_filter(filter_name, scope, logs)
+        if result.get("applied"):
+            return result
+        logs.append("[executor:video_frame] scene MP4 filter produced nothing — "
+                    "falling back to still frames")
+    return await _apply_image_filter(filter_name, scope, logs)
 
 
 async def _apply_image_filter(filter_name: str, scope: str, logs: list[str]) -> dict:
@@ -773,6 +882,13 @@ async def _handle_video_edit(intent: str, scope: str, parameters: dict, state: d
     if intent == "recompose_video":
         return await _recompose_final_video(state, logs)
 
+    # ── Per-scene retime: when scoped to one scene, adjust THAT clip and write
+    # scene_NN_..._<fast|slow>.mp4 so the next recompose stitches it in place
+    # (mirrors the per-scene colour-filter path). scope='all' falls through to
+    # the whole-video retime below.
+    if intent in ("speed_up_scene", "slow_down_scene") and scope.startswith("scene:") and _scene_mp4s_exist(scope):
+        return await _apply_scene_speed(intent, scope, parameters, logs)
+
     video_candidates = sorted((_OUTPUTS_DIR / "final").glob("*.mp4")) if (_OUTPUTS_DIR / "final").exists() else []
     if not video_candidates:
         video_candidates = list(_OUTPUTS_DIR.glob("*.mp4"))
@@ -829,6 +945,75 @@ async def _handle_video_edit(intent: str, scope: str, parameters: dict, state: d
     except subprocess.TimeoutExpired:
         logs.append("[executor:video] FFmpeg timed out")
         return {"type": "video", "intent": intent, "asset_paths": [], "applied": False, "note": "FFmpeg timed out"}
+
+
+async def _apply_scene_speed(intent: str, scope: str, parameters: dict, logs: list[str]) -> dict:
+    """Retime ONE scene's clip → outputs/video/scene_NN_..._<fast|slow>.mp4.
+
+    `setpts` requires a video re-encode (can't -c copy when changing PTS); audio is
+    retimed with a chained `atempo` (each link is limited to 0.5..2.0). The output
+    keeps the source's tier tag (e.g. ..._synced_aud_fast.mp4) so `_pick_scene_clip`
+    picks it as the newest variant on the next recompose.
+    """
+    if not _has_ffmpeg():
+        logs.append("[executor:video] FFmpeg not installed")
+        return {"type": "video", "intent": intent, "asset_paths": [], "applied": False,
+                "note": "FFmpeg not installed"}
+
+    video_dir = _OUTPUTS_DIR / "video"
+    sid = scope.split(":", 1)[1].strip()
+    try:
+        scene_id = int(sid)
+    except ValueError:
+        return {"type": "video", "intent": intent, "asset_paths": [], "applied": False,
+                "note": f"bad scene scope {scope!r}"}
+
+    src = _pick_scene_clip(video_dir, scene_id)
+    if src is None:
+        return {"type": "video", "intent": intent, "asset_paths": [], "applied": False,
+                "note": f"no clip for scene {scene_id} in {video_dir} — run Phase 3 first"}
+
+    speed = float(parameters.get("factor", 1.5 if intent == "speed_up_scene" else 0.75))
+    speed = max(0.25, min(4.0, speed))
+    tag   = "fast" if speed >= 1.0 else "slow"
+    out   = src.with_name(f"{src.stem}_{tag}{src.suffix}")
+
+    # atempo on an input with no audio stream is a hard error — probe first.
+    has_audio = bool(subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a:0",
+         "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(src)],
+        capture_output=True, text=True).stdout.strip())
+
+    cmd = ["ffmpeg", "-y", "-i", str(src),
+           "-filter:v", f"setpts={1.0 / speed:.4f}*PTS",
+           "-c:v", "libx264", "-pix_fmt", "yuv420p"]
+    if has_audio:
+        af_links, rem = [], speed
+        while rem > 2.0:
+            af_links.append("atempo=2.0"); rem /= 2.0
+        while rem < 0.5:
+            af_links.append("atempo=0.5"); rem /= 0.5
+        af_links.append(f"atempo={rem:.4f}")
+        cmd += ["-filter:a", ",".join(af_links), "-c:a", "aac", "-b:a", "128k"]
+    else:
+        cmd += ["-an"]
+    cmd.append(str(out))
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if proc.returncode == 0 and out.exists() and out.stat().st_size > 0:
+            logs.append(f"[executor:video] ✓ scene {scene_id} retimed x{speed:g} → {out.name}")
+            return {"type": "video", "intent": intent, "scene_id": scene_id, "speed": speed,
+                    "source": str(src), "output": str(out), "asset_paths": [str(out)],
+                    "applied": True,
+                    "note": "run 'recompose the video' to stitch the retimed clip into the final cut"}
+        logs.append(f"[executor:video] ✗ ffmpeg retiming scene {scene_id}: {proc.stderr[:300]}")
+        return {"type": "video", "intent": intent, "asset_paths": [], "applied": False,
+                "ffmpeg_error": proc.stderr[:300]}
+    except subprocess.TimeoutExpired:
+        logs.append(f"[executor:video] ✗ ffmpeg timed out retiming scene {scene_id}")
+        return {"type": "video", "intent": intent, "asset_paths": [], "applied": False,
+                "note": "FFmpeg timed out"}
 
 
 # ─── Recompose helper ─────────────────────────────────────────────────────────

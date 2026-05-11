@@ -21,7 +21,10 @@ def route_edit_execution(state: EditAgentState) -> EditAgentState:
         rerun_pipeline = True
     elif target == "audio":
         rerun_from = "phase2"
-        rerun_pipeline = True
+        # add_background_music is now self-contained — it mixes the new track
+        # straight onto the scene clip (recompose picks it up), so no Phase 2/3
+        # rerun. Voice changes still re-enter Phase 2 to re-mix dialogue.
+        rerun_pipeline = intent not in ("add_background_music",)
     elif target in ("video", "video_frame"):
         rerun_from = "phase3"
         # recompose_video is now self-contained (re-stitches existing per-scene

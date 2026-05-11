@@ -16,6 +16,16 @@ import asyncio
 import json
 import sys
 
+# CLI prints emoji/box-drawing chars; make stdout/stderr UTF-8 so a cp1252
+# Windows console doesn't crash with UnicodeEncodeError (matches the other
+# phase main.py entrypoints).
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        if _stream and _stream.encoding and _stream.encoding.lower() != "utf-8":
+            _stream.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 from agents.edit_agent.agent import EditAgent
 from state_manager.manager import StateManager
 
